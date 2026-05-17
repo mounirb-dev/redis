@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bun install *)",
+      "mcp__Snyk__snyk_code_scan",
+      "mcp__Snyk__snyk_auth",
+      "Bash(dir /s /b)",
+      "Bash(bun build *)"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "insforge"
+  ]
+}

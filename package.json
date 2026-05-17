@@ -1,0 +1,19 @@
+{
+  "name": "api-okmanus",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --watch src/index.ts",
+    "build": "bun build src/index.ts --target bun --outfile dist/index.js",
+    "start": "bun dist/index.js",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "elysia": "latest",
+    "redis": "^4.6.0"
+  },
+  "devDependencies": {
+    "bun-types": "latest",
+    "@types/bun": "latest"
+  }
+}
