@@ -48,6 +48,7 @@ services:
     command:
       [
         "--maxmemory=256mb",
+        "--cache_mode=true",
         "--snapshot_cron=30 * * * *",
       ]
     volumes:

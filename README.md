@@ -222,23 +222,39 @@ En `docker-compose.yml` también se fijan límites de contenedor:
 - API: `0.50 CPU`, `256 MB`, `128 PIDs`
 - Redis: `0.50 CPU`, `384 MB`, `128 PIDs`
 - Redis `maxmemory=256mb`
-- Redis `maxmemory-policy=allkeys-lru`
+- Dragonfly `cache_mode=true` para expulsar claves cuando se alcance `maxmemory`
 - `nofile` limitado
 
 Para producción, ajusta estos valores según RAM real del VPS.
 
 ## Dokploy
 
-Usa el `Dockerfile` incluido.
+Para que Redis/Dragonfly se despliegue junto a la API, crea la app en Dokploy como **Docker Compose** y usa:
+
+```text
+docker-compose.dokploy.yml
+```
+
+Ese stack levanta dos servicios en la misma red privada:
+
+- `api-okmanus`: expone la REST API compatible con Upstash.
+- `dragonfly`: guarda los datos Redis en el volumen persistente `dragonfly-data`.
+
+La API ya lleva:
+
+```bash
+REDIS_URL=redis://dragonfly:6379/0
+```
+
+No publiques el puerto `6379` en producción salvo que tengas una red privada/VPN. El compose de Dokploy no lo expone; solo la API puede hablar con Dragonfly.
 
 Variables mínimas en Dokploy:
 
 ```bash
-REDIS_URL=redis://tu-redis:6379/0
+APP_PORT=3000
 UPSTASH_REDIS_REST_TOKEN=<token-largo-y-aleatorio>
 UPSTASH_REDIS_REST_READONLY_TOKEN=<token-readonly-opcional>
-PORT=3000
-HOST=0.0.0.0
+OKMANUS_PRODUCT_CLIENT_TOKEN=<token-producto-largo-y-aleatorio>
 ```
 
 Health check:

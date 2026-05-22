@@ -5,3 +5,5 @@ dist
 .claude
 *.log
 .env
+.env.*
+!.env.example

@@ -1,0 +1,70 @@
+services:
+  api-okmanus:
+    build: .
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    environment:
+      PORT: 3000
+      HOST: 0.0.0.0
+      REDIS_URL: redis://dragonfly:6379/0
+      UPSTASH_REDIS_REST_TOKEN: ${UPSTASH_REDIS_REST_TOKEN:?set UPSTASH_REDIS_REST_TOKEN}
+      UPSTASH_REDIS_REST_READONLY_TOKEN: ${UPSTASH_REDIS_REST_READONLY_TOKEN:-}
+      RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS:-60}
+      RATE_LIMIT_MAX_REQUESTS: ${RATE_LIMIT_MAX_REQUESTS:-600}
+      MAX_BATCH_COMMANDS: ${MAX_BATCH_COMMANDS:-100}
+      MAX_COMMAND_ARGS: ${MAX_COMMAND_ARGS:-256}
+      MAX_ARG_BYTES: ${MAX_ARG_BYTES:-524288}
+      MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-1048576}
+      MAX_IN_FLIGHT_COMMANDS: ${MAX_IN_FLIGHT_COMMANDS:-50}
+      REDIS_COMMAND_QUEUE_MAX_LENGTH: ${REDIS_COMMAND_QUEUE_MAX_LENGTH:-500}
+      COMMAND_TIMEOUT_MS: ${COMMAND_TIMEOUT_MS:-5000}
+      OKMANUS_ALLOW_DANGEROUS_COMMANDS: ${OKMANUS_ALLOW_DANGEROUS_COMMANDS:-false}
+      OKMANUS_PRODUCT_CLIENT_TOKEN: ${OKMANUS_PRODUCT_CLIENT_TOKEN:?set OKMANUS_PRODUCT_CLIENT_TOKEN}
+      OKMANUS_JOB_TTL_SECONDS: ${OKMANUS_JOB_TTL_SECONDS:-604800}
+      OKMANUS_SESSION_QUEUE_TTL_SECONDS: ${OKMANUS_SESSION_QUEUE_TTL_SECONDS:-86400}
+      OKMANUS_QUEUE_MAX_JOBS: ${OKMANUS_QUEUE_MAX_JOBS:-1000}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-openrouter/auto}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.1-8b-instant}
+      BROWSERLESS_API_KEY: ${BROWSERLESS_API_KEY:-}
+      BROWSERLESS_ENDPOINT: ${BROWSERLESS_ENDPOINT:-https://production-sfo.browserless.io}
+    depends_on:
+      dragonfly:
+        condition: service_healthy
+    cpus: "${API_CPUS:-0.50}"
+    mem_limit: ${API_MEM_LIMIT:-256m}
+    pids_limit: 128
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+    restart: unless-stopped
+
+  dragonfly:
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
+    command:
+      [
+        "--maxmemory=${DRAGONFLY_MAXMEMORY:-256mb}",
+        "--cache_mode=true",
+        "--snapshot_cron=${DRAGONFLY_SNAPSHOT_CRON:-30 * * * *}",
+      ]
+    volumes:
+      - dragonfly-data:/data
+    cpus: "${DRAGONFLY_CPUS:-0.50}"
+    mem_limit: ${DRAGONFLY_MEM_LIMIT:-384m}
+    pids_limit: 128
+    ulimits:
+      memlock: -1
+      nofile:
+        soft: 4096
+        hard: 8192
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  dragonfly-data:

@@ -3,11 +3,6 @@ import { Elysia } from "elysia";
 // Cliente oficial de Redis para Node.js/Bun
 import { createClient } from "redis";
 import type { RedisClientType } from "redis";
-import {
-  buildNoToolCallRetryMessage,
-  classifyBrowserBlock,
-  parseBrowserToolCallFromText,
-} from "./browser-agent-control";
 
 // Argumento de un comando Redis: string o datos binarios
 type RedisArg = string | Buffer;
@@ -49,18 +44,11 @@ const productClientToken = process.env.OKMANUS_PRODUCT_CLIENT_TOKEN;
 const appwriteEndpoint = process.env.APPWRITE_ENDPOINT?.replace(/\/$/, "");
 const appwriteProjectId = process.env.APPWRITE_PROJECT_ID;
 const requireAppwriteSession = process.env.OKMANUS_REQUIRE_APPWRITE_SESSION === "true";
-const openRouterApiKey = process.env.OPENROUTER_API_KEY;
-const openRouterModel = process.env.OPENROUTER_MODEL ?? "openrouter/auto";
-const groqApiKey = process.env.GROQ_API_KEY;
-// gpt-oss-120b reliably emits real `tool_calls` when tool_choice="required";
-// llama-3.3-70b on Groq tends to narrate the call in text instead.
-const groqModel = process.env.GROQ_MODEL ?? "openai/gpt-oss-120b";
 const browserlessApiKey = process.env.BROWSERLESS_API_KEY;
 const browserlessEndpoint = (process.env.BROWSERLESS_ENDPOINT ?? "https://production-sfo.browserless.io").replace(/\/$/, "");
 const mcpRegistryTtlSeconds = Number(process.env.MCP_REGISTRY_TTL_SECONDS ?? 3600);
 const mcpHeartbeatTtlSeconds = Number(process.env.MCP_HEARTBEAT_TTL_SECONDS ?? 90);
 const mcpSessionTtlSeconds = Number(process.env.MCP_SESSION_TTL_SECONDS ?? 3600);
-const credentialConsentTtlSeconds = Number(process.env.CREDENTIAL_CONSENT_TTL_SECONDS ?? 30 * 24 * 3600);
 const okmanusJobTtlSeconds = Number(process.env.OKMANUS_JOB_TTL_SECONDS ?? 7 * 24 * 3600);
 const okmanusSessionQueueTtlSeconds = Number(process.env.OKMANUS_SESSION_QUEUE_TTL_SECONDS ?? 24 * 3600);
 const okmanusQueueMaxJobs = Number(process.env.OKMANUS_QUEUE_MAX_JOBS ?? 1000);
@@ -80,12 +68,16 @@ const redisUrl =
   }${process.env.REDIS_HOST ?? "localhost"}:${process.env.REDIS_PORT ?? "6379"}/${process.env.REDIS_DB ?? "0"}`;
 
 // Token con acceso total; acepta 3 nombres de variable distintos para compatibilidad con Upstash
-// ADVERTENCIA: el default "change-me" es inseguro; debe cambiarse en producción
 const standardToken =
   process.env.UPSTASH_REDIS_REST_TOKEN ??
   process.env.OKMANUS_REDIS_REST_TOKEN ??
-  process.env.API_KEY ??
-  "change-me";
+  process.env.API_KEY;
+
+if (!standardToken) {
+  throw new Error(
+    "FATAL: set UPSTASH_REDIS_REST_TOKEN, OKMANUS_REDIS_REST_TOKEN, or API_KEY — server refuses to start without auth token",
+  );
+}
 
 // Token opcional de solo lectura; si no se configura, no existe y la función queda desactivada
 const readOnlyToken =
@@ -479,23 +471,6 @@ async function verifyAppwriteJwt(request: Request) {
   }
 
   return { ok: true, user: data, error: "", status: 200 };
-}
-
-async function requireAppwriteUser(request: Request) {
-  const auth = await verifyAppwriteJwt(request);
-  if (!auth.ok) return auth;
-  const user = auth.user as Record<string, unknown> | null;
-  const userId = typeof user?.$id === "string" ? user.$id : "";
-  if (!userId) {
-    return {
-      ok: false,
-      user: null,
-      error: "Appwrite session is required for credential consent",
-      status: appwriteEndpoint && appwriteProjectId ? 401 : 503,
-    };
-  }
-
-  return { ok: true, user, userId, error: "", status: 200 };
 }
 
 // Convierte un valor JSON crudo a un array de strings/Buffers válido para Redis
@@ -1052,7 +1027,6 @@ function serializeJob(hash: Record<string, string>) {
     prompt: hash.prompt,
     target: JSON.parse(hash.target || "{}"),
     runtime: JSON.parse(hash.runtime || "{}"),
-    llm: JSON.parse(hash.llm || "{}"),
     artifacts: JSON.parse(hash.artifacts || "{}"),
     verification: JSON.parse(hash.verification || "{}"),
     created_at: hash.createdAt,
@@ -1133,116 +1107,6 @@ async function ensureSessionManifest(input: {
     .exec();
 }
 
-function credentialConsentIndexKey(userId: string) {
-  return `okm:user:${userId}:credential_consents`;
-}
-
-function credentialConsentKey(userId: string, providerId: string) {
-  return `okm:cred:${userId}:${providerId}`;
-}
-
-function serializeCredentialConsent(hash: Record<string, string>) {
-  return {
-    providerId: hash.providerId,
-    providerName: hash.providerName,
-    status: hash.status,
-    vaultProvider: hash.vaultProvider,
-    secretRef: hash.secretRef,
-    scopes: JSON.parse(hash.scopes || "[]") as string[],
-    last4: hash.last4 || "",
-    note: hash.note || "",
-    createdAt: hash.createdAt,
-    updatedAt: hash.updatedAt,
-    expiresAt: hash.expiresAt,
-  };
-}
-
-async function getCredentialConsent(userId: string, providerId: string) {
-  const reply = await redis.sendCommand(["HGETALL", credentialConsentKey(userId, providerId)]) as RedisReply;
-  const hash = parseRedisHash(reply);
-  if (!hash.providerId) return null;
-  return serializeCredentialConsent(hash);
-}
-
-async function listCredentialConsents(userId: string) {
-  const providerIds = parseRedisArray(await redis.sendCommand(["SMEMBERS", credentialConsentIndexKey(userId)]) as RedisReply);
-  const records = await Promise.all(providerIds.map((providerId) => getCredentialConsent(userId, providerId)));
-  return records.filter(Boolean);
-}
-
-const credentialVaultOptions = [
-  {
-    id: "infisical",
-    category: "open-source-cloud",
-    mode: ["self-hosted", "managed-cloud"],
-    recommendedFor: "Mejor primera opcion para OkManus: UI clara, API/SDK, proyectos por workspace y buen camino self-host.",
-    storesSecret: true,
-  },
-  {
-    id: "openbao",
-    category: "open-source",
-    mode: ["self-hosted"],
-    recommendedFor: "Vault compatible y gobernanza abierta; fuerte si quereis politicas, auditoria y control infra.",
-    storesSecret: true,
-  },
-  {
-    id: "conjur",
-    category: "open-source",
-    mode: ["self-hosted", "enterprise-cloud"],
-    recommendedFor: "Control de acceso machine-to-machine y auditoria estricta.",
-    storesSecret: true,
-  },
-  {
-    id: "sops-age",
-    category: "open-source",
-    mode: ["git-encrypted-files"],
-    recommendedFor: "Configuracion interna y repos, no ideal para consentimiento dinamico por usuario final.",
-    storesSecret: true,
-  },
-  {
-    id: "pangea-vault",
-    category: "cloud",
-    mode: ["managed-cloud"],
-    recommendedFor: "API-first para secretos/tokens de usuario si no quereis operar vault.",
-    storesSecret: true,
-  },
-  {
-    id: "akeyless",
-    category: "cloud",
-    mode: ["managed-cloud", "hybrid"],
-    recommendedFor: "Enterprise/multicloud con rotacion, auditoria y secretos dinamicos.",
-    storesSecret: true,
-  },
-  {
-    id: "aws-secrets-manager",
-    category: "cloud",
-    mode: ["aws-managed"],
-    recommendedFor: "Si desplegais OkManus en AWS y quereis IAM/KMS/CloudTrail nativo.",
-    storesSecret: true,
-  },
-  {
-    id: "google-secret-manager",
-    category: "cloud",
-    mode: ["gcp-managed"],
-    recommendedFor: "Si desplegais OkManus en Google Cloud y quereis IAM/auditoria nativa.",
-    storesSecret: true,
-  },
-  {
-    id: "azure-key-vault",
-    category: "cloud",
-    mode: ["azure-managed"],
-    recommendedFor: "Si desplegais OkManus en Azure y quereis Key Vault/Managed Identity.",
-    storesSecret: true,
-  },
-  {
-    id: "okap",
-    category: "delegation-protocol",
-    mode: ["user-vault-delegation"],
-    recommendedFor: "Modelo emergente para que el usuario delegue acceso desde su vault sin copiar claves a OkManus.",
-    storesSecret: false,
-  },
-];
-
 async function appendMcpEvent(mcpId: string, workspaceId: string, event: Record<string, unknown>) {
   const streamKey = `okm:mcp:${mcpId}:stream:${workspaceId}`;
   await redis.sendCommand([
@@ -1271,26 +1135,6 @@ function buildBootstrapManifest() {
     ttlSeconds: 3600,
     providers: [
       {
-        id: "groq-primary",
-        type: "llm",
-        name: "Groq",
-        endpoint: "/v1/llm/test",
-        capabilities: ["chat", "openai-compatible", "fast"],
-        priority: 1,
-        secretRef: "server:GROQ_API_KEY",
-        model: groqModel,
-      },
-      {
-        id: "openrouter-primary",
-        type: "llm",
-        name: "OpenRouter",
-        endpoint: "/v1/llm/test",
-        capabilities: ["chat", "openai-compatible"],
-        priority: 1,
-        secretRef: "server:OPENROUTER_API_KEY",
-        model: openRouterModel,
-      },
-      {
         id: "browserless-computer",
         type: "computer",
         name: "Browserless",
@@ -1301,95 +1145,8 @@ function buildBootstrapManifest() {
       },
     ],
     routingTable: {
-      "llm-default": groqApiKey ? ["groq-primary", "openrouter-primary"] : ["openrouter-primary"],
       computer: ["browserless-computer"],
     },
-  };
-}
-
-type LlmProviderId = "groq" | "openrouter";
-
-const llmProviderDefaults = {
-  groq: {
-    id: "groq" as const,
-    name: "Groq",
-    endpoint: "https://api.groq.com/openai/v1/chat/completions",
-    model: groqModel,
-    apiKey: groqApiKey,
-  },
-  openrouter: {
-    id: "openrouter" as const,
-    name: "OpenRouter",
-    endpoint: "https://openrouter.ai/api/v1/chat/completions",
-    model: openRouterModel,
-    apiKey: openRouterApiKey,
-  },
-};
-
-function normalizeLlmProvider(value: unknown): LlmProviderId {
-  const provider = typeof value === "string" ? value.toLowerCase().replace(/[^a-z0-9]/g, "") : "";
-  if (provider.includes("groq")) return "groq";
-  if (provider.includes("openrouter")) return "openrouter";
-  return groqApiKey ? "groq" : "openrouter";
-}
-
-type LlmMessage = { role: "system" | "user" | "assistant"; content: string };
-
-async function callOpenAiCompatibleProvider(input: {
-  provider: LlmProviderId;
-  apiKey?: string;
-  model?: string;
-  prompt?: string;
-  messages?: LlmMessage[];
-  maxTokens?: number;
-  tools?: unknown[];
-  toolChoice?: unknown;
-}) {
-  const defaults = llmProviderDefaults[input.provider];
-  const apiKey = input.apiKey?.trim() || defaults.apiKey;
-  if (!apiKey) throw new Error(`${defaults.name} API key is not configured`);
-
-  const headers: Record<string, string> = {
-    authorization: `Bearer ${apiKey}`,
-    "content-type": "application/json",
-  };
-  if (input.provider === "openrouter") {
-    headers["http-referer"] = "http://localhost";
-    headers["x-title"] = "OkManus local integration";
-  }
-
-  const messages: LlmMessage[] = input.messages ?? [
-    { role: "user", content: input.prompt ?? "" },
-  ];
-
-  const body: Record<string, unknown> = {
-    model: input.model?.trim() || defaults.model,
-    messages,
-    max_tokens: input.maxTokens ?? 512,
-  };
-  if (input.tools) {
-    body.tools = input.tools;
-    body.tool_choice = input.toolChoice ?? "auto";
-  }
-
-  const response = await fetch(defaults.endpoint, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-  });
-
-  const data = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new Error(data?.error?.message ?? `${defaults.name} failed: ${response.status}`);
-  }
-
-  const choice = data?.choices?.[0];
-  return {
-    provider: defaults.id,
-    model: data?.model ?? input.model ?? defaults.model,
-    content: choice?.message?.content ?? "",
-    toolCalls: choice?.message?.tool_calls ?? null,
-    finishReason: choice?.finish_reason ?? "stop",
   };
 }
 
@@ -1538,9 +1295,8 @@ app.get("/v1/health", async () => {
   return {
     status: "healthy",
     redis: pong === "PONG" ? "connected" : "unknown",
-    providers: {
-      groq: groqApiKey ? "configured" : "missing_credentials",
-      openrouter: openRouterApiKey ? "configured" : "missing_credentials",
+    services: {
+      redis: "connected",
       browserless: browserlessApiKey ? "configured" : "missing_credentials",
     },
     timestamp: new Date().toISOString(),
@@ -1629,7 +1385,6 @@ app.post("/v1/jobs", async ({ request }) => {
     prompt,
     target: jsonField(body.target),
     runtime: jsonField(body.runtime),
-    llm: jsonField(body.llm ?? body.llm_chain),
     artifacts: jsonField(body.artifacts),
     verification: jsonField(body.verification),
     createdAt: now.toISOString(),
@@ -1768,121 +1523,47 @@ app.post("/v1/queues/:plan/:taskType/:region/next", async ({ params }) => {
 });
 
 app.get("/v1/credential-vaults/options", () => ({
-  options: credentialVaultOptions,
-  consentModel: {
-    rule: "OkManus stores consent metadata and external secret references only, never raw user API keys.",
-    dragonflyKeys: {
-      userIndex: "okm:user:{user_id}:credential_consents",
-      consentHash: "okm:cred:{user_id}:{provider_id}",
-    },
-    ttlSeconds: credentialConsentTtlSeconds,
-  },
+  error: "Credential vault metadata moved to okmanus-apis",
+  service: "okmanus-apis",
+  replacement: "/v1/credential-vaults/options",
 }));
 
 app.get("/v1/credentials/consents", async ({ request }) => {
-  const auth = await requireAppwriteUser(request);
-  if (!auth.ok) return makeJsonResponse({ error: auth.error }, auth.status);
-
-  return {
-    userId: auth.userId,
-    consents: await listCredentialConsents(auth.userId),
-  };
+  void request;
+  return makeJsonResponse(
+    {
+      error: "Credential consents moved to okmanus-apis and Infisical",
+      service: "okmanus-apis",
+      replacement: "/v1/credentials/consents",
+    },
+    410,
+  );
 });
 
 app.post("/v1/credentials/consents", async ({ request }) => {
-  const auth = await requireAppwriteUser(request);
-  if (!auth.ok) return makeJsonResponse({ error: auth.error }, auth.status);
-
-  const body = await readJsonObject(request);
-  if (typeof body.apiKey === "string" || typeof body.secretValue === "string" || typeof body.token === "string") {
-    return makeJsonResponse({ error: "Raw API keys are not accepted here; store them in a vault and send secretRef only" }, 400);
-  }
-
-  const providerId = normalizeRedisId(body.providerId ?? body.provider, "provider");
-  const providerName = stringField(body.providerName ?? body.provider, providerId);
-  const vaultProvider = normalizeRedisId(body.vaultProvider, "external-vault");
-  const secretRef = optionalStringField(body.secretRef);
-  const status = body.allowed === false ? "revoked" : "allowed";
-  const scopes = stringArrayField(body.scopes);
-  const ttlSeconds = numberField(body.ttlSeconds, credentialConsentTtlSeconds, 300, 365 * 24 * 3600);
-  const now = new Date();
-  const existing = await getCredentialConsent(auth.userId, providerId);
-  const createdAt = existing?.createdAt ?? now.toISOString();
-  const expiresAt = new Date(now.getTime() + ttlSeconds * 1000).toISOString();
-  const key = credentialConsentKey(auth.userId, providerId);
-  const indexKey = credentialConsentIndexKey(auth.userId);
-
-  await redis
-    .multi()
-    .hSet(key, {
-      providerId,
-      providerName,
-      status,
-      vaultProvider,
-      secretRef,
-      scopes: JSON.stringify(scopes),
-      last4: optionalStringField(body.last4).slice(-4),
-      note: optionalStringField(body.note).slice(0, 280),
-      createdAt,
-      updatedAt: now.toISOString(),
-      expiresAt,
-    })
-    .expire(key, ttlSeconds)
-    .sAdd(indexKey, providerId)
-    .expire(indexKey, ttlSeconds)
-    .xAdd(
-      `okm:user:${auth.userId}:credential_events`,
-      "*",
-      {
-        event: JSON.stringify({
-          type: "credential.consent.upserted",
-          providerId,
-          vaultProvider,
-          hasSecretRef: Boolean(secretRef),
-          status,
-          createdAt: now.toISOString(),
-        }),
-      },
-      { TRIM: { strategy: "MAXLEN", strategyModifier: "~", threshold: 500 } },
-    )
-    .expire(`okm:user:${auth.userId}:credential_events`, Math.max(ttlSeconds, 3600))
-    .exec();
-
-  return {
-    consent: await getCredentialConsent(auth.userId, providerId),
-    key,
-    ttlSeconds,
-  };
+  void request;
+  return makeJsonResponse(
+    {
+      error: "Credential writes moved to okmanus-apis and Infisical",
+      service: "okmanus-apis",
+      replacement: "/v1/credentials/consents",
+    },
+    410,
+  );
 });
 
 app.delete("/v1/credentials/consents/:providerId", async ({ request, params }) => {
-  const auth = await requireAppwriteUser(request);
-  if (!auth.ok) return makeJsonResponse({ error: auth.error }, auth.status);
-
-  const providerId = normalizeRedisId(params.providerId, "provider");
-  const now = new Date().toISOString();
-  await redis
-    .multi()
-    .del(credentialConsentKey(auth.userId, providerId))
-    .sRem(credentialConsentIndexKey(auth.userId), providerId)
-    .xAdd(
-      `okm:user:${auth.userId}:credential_events`,
-      "*",
-      {
-        event: JSON.stringify({
-          type: "credential.consent.revoked",
-          providerId,
-          createdAt: now,
-        }),
-      },
-      { TRIM: { strategy: "MAXLEN", strategyModifier: "~", threshold: 500 } },
-    )
-    .expire(`okm:user:${auth.userId}:credential_events`, Math.max(credentialConsentTtlSeconds, 3600))
-    .exec();
-
-  return { ok: true, providerId, revokedAt: now };
+  void request;
+  return makeJsonResponse(
+    {
+      error: "Credential revocation moved to okmanus-apis and Infisical",
+      service: "okmanus-apis",
+      providerId: params.providerId,
+      replacement: "/v1/credentials/consents/:providerId",
+    },
+    410,
+  );
 });
-
 app.get("/v1/database/schema", () => ({
   dialect: "postgres",
   purpose: "OkManus persistent source of truth",
@@ -1912,9 +1593,6 @@ app.get("/v1/database/schema", () => ({
     mcpStream: "okm:mcp:{mcp_id}:stream:{workspace_id}",
     workspaceRateLimit: "okm:ws:{workspace_id}:rl:{metric}",
     workspaceLocks: "okm:ws:{workspace_id}:lock:{resource_id}",
-    credentialConsentIndex: "okm:user:{user_id}:credential_consents",
-    credentialConsent: "okm:cred:{user_id}:{provider_id}",
-    credentialEvents: "okm:user:{user_id}:credential_events",
     runnerHeartbeat: "okm:runner:{runner_id}:heartbeat",
     job: "okm:job:{job_id}",
     jobProgress: "okm:job:{job_id}:progress",
@@ -1931,48 +1609,27 @@ app.get("/v1/database/schema", () => ({
 }));
 
 app.post("/v1/llm/test", async ({ request }) => {
-  const body = await readJsonObject(request).catch(() => ({}));
-  const prompt = stringField(body.prompt, "Reply with exactly: okmanus-llm-ok");
-  const provider = normalizeLlmProvider(body.provider);
-
-  try {
-    const result = await callOpenAiCompatibleProvider({
-      provider,
-      prompt,
-      model: typeof body.model === "string" ? body.model : undefined,
-    });
-    await redis.set(
-      `okm:provider:${result.provider}:last_test`,
-      JSON.stringify({ ...result, content: undefined, ok: true, testedAt: new Date().toISOString() }),
-      { EX: 3600 },
-    );
-    return result;
-  } catch (error) {
-    return makeJsonResponse(formatError(error), 503);
-  }
+  void request;
+  return makeJsonResponse(
+    {
+      error: "LLM calls moved to okmanus-apis",
+      service: "okmanus-apis",
+      replacement: "/v1/llm/chat",
+    },
+    410,
+  );
 });
 
 app.post("/v1/providers/test", async ({ request }) => {
-  const body = await readJsonObject(request).catch(() => ({}));
-  const provider = normalizeLlmProvider(body.provider ?? body.name);
-  const prompt = stringField(body.prompt, "Reply with exactly: okmanus-provider-ok");
-
-  try {
-    const result = await callOpenAiCompatibleProvider({
-      provider,
-      prompt,
-      apiKey: typeof body.apiKey === "string" ? body.apiKey : undefined,
-      model: typeof body.model === "string" ? body.model : undefined,
-    });
-    await redis.set(
-      `okm:provider:${result.provider}:last_key_test`,
-      JSON.stringify({ provider: result.provider, model: result.model, ok: true, testedAt: new Date().toISOString() }),
-      { EX: 3600 },
-    );
-    return { ...result, apiKeyAccepted: true };
-  } catch (error) {
-    return makeJsonResponse(formatError(error), 503);
-  }
+  void request;
+  return makeJsonResponse(
+    {
+      error: "Provider tests moved to okmanus-apis",
+      service: "okmanus-apis",
+      replacement: "/v1/providers/test",
+    },
+    410,
+  );
 });
 
 app.post("/v1/mcps/register", async ({ request }) => {
@@ -2143,814 +1800,29 @@ app.post("/v1/computer/browserless", async ({ request }) => {
   return payload;
 });
 
-// ──────────────────────────────────────────────────────────────────────────
-// ReAct browser agent: LLM plans → Browserless executes → screenshot feeds
-// back → LLM reasons again. Up to REACT_MAX_STEPS iterations.
-// ──────────────────────────────────────────────────────────────────────────
-
-const REACT_MAX_STEPS = 20;
-
-const NO_TOOL_CALL_RETRY_LIMIT = 2;
-
-function sanitizeAgentText(input: string): string {
-  if (!input) return "";
-  let out = input;
-  // Strip hallucinated tool-call XML: <function=NAME>...</function>
-  out = out.replace(/<function=\w+>[\s\S]*?<\/function>\.?/g, "");
-  // Strip self-closing XML tool calls: <navigate url="..."/> <click selector="..."/>
-  out = out.replace(/<(?:navigate|click|type|scroll|extract|screenshot|finish)\b[^>]*\/?>/gi, "");
-  out = out.replace(/<\/(?:navigate|click|type|scroll|extract|screenshot|finish)>/gi, "");
-  // Strip bracket pseudo-syntax
-  out = out.replace(/\[tool_call:[\s\S]*?\]/g, "");
-  // Strip bare keyword + JSON: navigate{"url":"..."}  finish{"summary":"..."}
-  out = out.replace(/\b(?:navigate|click|type|scroll|extract|screenshot|finish)\s*\{[^{}]*\}\.?/gi, "");
-  // Strip various tool-call leakage tokens
-  out = out.replace(/<\|tool_call\|>/g, "");
-  out = out.replace(/<\/?tool_call>/g, "");
-  out = out.replace(/<\|python_tag\|>/g, "");
-  out = out.replace(/<\|eom_id\|>/g, "");
-  out = out.replace(/<\|eot_id\|>/g, "");
-  // Strip fake screenshot placeholders
-  out = out.replace(/Screenshot:\s*\[[^\]]*\]/gi, "");
-  out = out.replace(/\[imagen de la página actual\]/gi, "");
-  // Strip "A continuación, ..." filler lines often used in hallucinated narrations
-  out = out.replace(/^\s*A continuación[^\n]*$/gim, "");
-  // Collapse 3+ newlines to 2
-  out = out.replace(/\n{3,}/g, "\n\n");
-  return out.trim();
-}
-
-// Regex used to recover hallucinated tool calls the model emits as plain text
-// instead of via the real `tool_calls` field. Example match:
-//   <function=navigate>{"url":"https://google.com"}</function>
-const TEXT_TOOL_CALL_REGEX = /<function=(\w+)>([\s\S]*?)<\/function>/;
-
-const BROWSER_TOOL_NAMES = new Set([
-  "navigate",
-  "click",
-  "type",
-  "scroll",
-  "extract",
-  "screenshot",
-  "finish",
-]);
-
-/**
- * If the LLM hallucinated a tool call as plain text, extract the first
- * occurrence and convert it into the shape of an OpenAI `tool_calls[0]`
- * entry so the ReAct loop can execute it like a real one.
- *
- * Returns null when no valid pseudo-call is present.
- */
-function parseBrowserToolCallFromText(
-  content: string,
-): { id: string; type: "function"; function: { name: string; arguments: string } } | null {
-  if (!content) return null;
-
-  // Format A: <function=name>{json}</function>
-  const matchA = content.match(TEXT_TOOL_CALL_REGEX);
-  if (matchA) {
-    const [, name, rawArgs] = matchA;
-    if (BROWSER_TOOL_NAMES.has(name)) {
-      let argsText = (rawArgs ?? "").trim();
-      const firstBrace = argsText.indexOf("{");
-      const lastBrace = argsText.lastIndexOf("}");
-      argsText = firstBrace >= 0 && lastBrace > firstBrace
-        ? argsText.slice(firstBrace, lastBrace + 1)
-        : "{}";
-      try { JSON.parse(argsText); } catch { argsText = "{}"; }
-      return {
-        id: `parsed-${crypto.randomUUID()}`,
-        type: "function",
-        function: { name, arguments: argsText },
-      };
-    }
-  }
-
-  // Format B: self-closing XML tag <navigate url="..."/> <click selector="..."/> <type selector="..." text="..."/>
-  const xmlMatch = content.match(
-    /<(navigate|click|type|scroll|extract|screenshot|finish)\b([^>]*?)\/?>/i,
-  );
-  if (xmlMatch) {
-    const name = xmlMatch[1].toLowerCase();
-    const attrBlob = xmlMatch[2] || "";
-    const args: Record<string, string> = {};
-    // Match attr="value" or attr='value' (handles escaped quotes loosely)
-    const attrRegex = /(\w+)\s*=\s*"([^"]*)"|(\w+)\s*=\s*'([^']*)'/g;
-    let m: RegExpExecArray | null;
-    while ((m = attrRegex.exec(attrBlob)) !== null) {
-      const key = m[1] ?? m[3];
-      const val = m[2] ?? m[4] ?? "";
-      if (key) args[key] = val;
-    }
-    return {
-      id: `parsed-${crypto.randomUUID()}`,
-      type: "function",
-      function: { name, arguments: JSON.stringify(args) },
-    };
-  }
-
-  // Format D: bare keyword + JSON: navigate{"url":"..."}  click{"selector":"..."}
-  const bareMatch = content.match(
-    /\b(navigate|click|type|scroll|extract|screenshot|finish)\s*(\{[^{}]*\})/i,
-  );
-  if (bareMatch) {
-    const name = bareMatch[1].toLowerCase();
-    let argsText = bareMatch[2] || "{}";
-    try { JSON.parse(argsText); } catch { argsText = "{}"; }
-    return {
-      id: `parsed-${crypto.randomUUID()}`,
-      type: "function",
-      function: { name, arguments: argsText },
-    };
-  }
-
-  // Format C: JSON code block { "name": "navigate", "arguments": {...} }
-  const jsonBlock = content.match(
-    /\{\s*"name"\s*:\s*"(navigate|click|type|scroll|extract|screenshot|finish)"\s*,\s*"arguments"\s*:\s*(\{[\s\S]*?\})\s*\}/i,
-  );
-  if (jsonBlock) {
-    const name = jsonBlock[1].toLowerCase();
-    let argsText = jsonBlock[2] || "{}";
-    try { JSON.parse(argsText); } catch { argsText = "{}"; }
-    return {
-      id: `parsed-${crypto.randomUUID()}`,
-      type: "function",
-      function: { name, arguments: argsText },
-    };
-  }
-
-  return null;
-}
-
-/**
- * Coaching message sent back to the model when it failed to emit any tool call
- * (either real or as recoverable hallucinated text). Encourages it to retry
- * with a real `tool_calls` payload instead of imitating the schema in prose.
- */
-function buildNoToolCallRetryMessage(input: {
-  objective: string;
-  currentUrl: string;
-  rawContent: string;
-  attempt: number;
-  maxAttempts: number;
-}): string {
-  const { objective, currentUrl, attempt, maxAttempts } = input;
-  return (
-    `No detecté ninguna tool_call en tu última respuesta. ` +
-    `Intento ${attempt}/${maxAttempts}.\n` +
-    `Objetivo: ${objective}\n` +
-    `URL actual: ${currentUrl}\n\n` +
-    `Recordatorio: DEBES emitir la herramienta mediante el campo tool_calls de la API. ` +
-    `Está PROHIBIDO escribir <function=...>...</function> u otra imitación textual. ` +
-    `Emite UNA tool_call ahora. Si ya terminaste, usa 'finish' con un summary real.`
-  );
-}
-
-/**
- * Heuristic detector for external block pages (captcha, consent, login walls).
- * Used to short-circuit the loop and surface a clear message to the user
- * instead of letting the model spin uselessly.
- */
-function classifyBrowserBlock(input: {
-  url: string;
-  title: string;
-  extracted: string;
-}): { kind: string; detail: string } | null {
-  const blob = `${input.url}\n${input.title}\n${input.extracted}`.toLowerCase();
-
-  if (/\/sorry\/index|unusual traffic|tráfico inusual|recaptcha/.test(blob)) {
-    return {
-      kind: "captcha",
-      detail: "Google bloqueó la sesión con captcha (sorry/index). Hace falta intervención humana o una API oficial.",
-    };
-  }
-  if (/consent\.google|consent\.youtube|cookieconsent|consent\.gstatic/.test(blob)) {
-    return {
-      kind: "consent_wall",
-      detail: "Página de consentimiento de cookies bloquea la navegación automatizada.",
-    };
-  }
-  // Strict login-wall detection: only trigger when URL is a known auth page,
-  // not when "login" appears as a footer link in normal pages.
-  if (/accounts\.google\.com\/signin|accounts\.google\.com\/v3\/signin|login\.microsoftonline\.com|login\.live\.com|appleid\.apple\.com\/auth|github\.com\/login/.test(input.url)) {
-    return {
-      kind: "login_required",
-      detail: "El destino exige login. Se necesita sesión autenticada del usuario.",
-    };
-  }
-  if (/access denied|forbidden|403|cloudflare|just a moment/.test(blob)) {
-    return {
-      kind: "anti_bot",
-      detail: "Anti-bot (Cloudflare u otro) bloqueó la petición.",
-    };
-  }
-  return null;
-}
-
-const BROWSER_TOOLS = [
-  {
-    type: "function",
-    function: {
-      name: "navigate",
-      description: "Navega a una URL en el navegador.",
-      parameters: {
-        type: "object",
-        properties: { url: { type: "string", description: "URL completa a visitar" } },
-        required: ["url"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "click",
-      description: "Hace clic en un elemento del DOM por selector CSS.",
-      parameters: {
-        type: "object",
-        properties: { selector: { type: "string", description: "Selector CSS del elemento" } },
-        required: ["selector"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "type",
-      description: "Escribe texto en un campo de formulario por selector CSS.",
-      parameters: {
-        type: "object",
-        properties: {
-          selector: { type: "string", description: "Selector CSS del campo" },
-          text: { type: "string", description: "Texto a escribir" },
-        },
-        required: ["selector", "text"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "scroll",
-      description: "Hace scroll hacia abajo en la página actual.",
-      parameters: { type: "object", properties: {} },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "extract",
-      description: "Extrae el texto visible de un selector CSS (máximo 4000 caracteres).",
-      parameters: {
-        type: "object",
-        properties: {
-          selector: { type: "string", description: "Selector CSS del elemento a extraer" },
-        },
-        required: ["selector"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "screenshot",
-      description: "Toma un screenshot de la página actual sin navegar.",
-      parameters: { type: "object", properties: {} },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "finish",
-      description: "Declara la tarea terminada y devuelve un resumen al usuario.",
-      parameters: {
-        type: "object",
-        properties: {
-          summary: { type: "string", description: "Resumen del resultado para el usuario" },
-        },
-        required: ["summary"],
-      },
-    },
-  },
-];
-
-async function executeBrowserAction(action: string, args: Record<string, string>, currentUrl: string) {
-  if (!browserlessApiKey) throw new Error("BROWSERLESS_API_KEY is not configured");
-  const url = action === "navigate" ? (args.url ?? currentUrl) : currentUrl;
-  // Anti-bot stack for /function REST endpoint. Note: solveCaptchas, humanlike
-  // and blockConsentModals are not supported on /function — they require
-  // CDP/BQL mode. Stealth fingerprint + residential US proxy is the best we
-  // can do here and bypasses most non-Google captchas.
-  const browserlessQs = new URLSearchParams({
-    token: browserlessApiKey,
-    stealth: "true",
-    blockAds: "true",
-    proxy: "residential",
-    proxyCountry: "us",
-    timeout: "60000",
-  }).toString();
-  const response = await fetch(`${browserlessEndpoint}/function?${browserlessQs}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      code: browserlessFunctionCode(),
-      context: {
-        action,
-        url,
-        selector: args.selector ?? "",
-        text: args.text ?? "",
-        extractSelector: args.selector ?? "body",
-      },
-    }),
-  });
-
-  const data = await response.json().catch(() => null);
-  if (!response.ok || data?.data?.error) {
-    throw new Error(data?.data?.error ?? data?.error ?? `Browserless failed: ${response.status}`);
-  }
-
-  return {
-    finalUrl: data?.data?.finalUrl ?? url,
-    title: data?.data?.title ?? "",
-    extracted: data?.data?.extracted ?? "",
-    blocked: classifyBrowserBlock({
-      url: data?.data?.finalUrl ?? url,
-      title: data?.data?.title ?? "",
-      extracted: data?.data?.extracted ?? data?.data?.blockedDetails ?? "",
-    }),
-    typed: Boolean(data?.data?.typed),
-    clicked: Boolean(data?.data?.clicked),
-    screenshotBase64: data?.data?.screenshotBase64 ?? "",
-  };
-}
-
-type BrowserAgentInput = {
-  objective: string;
-  provider: LlmProviderId;
-  sessionId: string;
-  startUrl: string;
-  maxSteps: number;
-};
-
-type BrowserAgentEvent =
-  | { event: "start"; data: { sessionId: string; objective: string; startUrl: string; maxSteps: number } }
-  | { event: "thought"; data: { step: number; status: "thinking" } }
-  | { event: "tool_call"; data: { step: number; action: string; args: Record<string, string>; parsedFromText: boolean } }
-  | { event: "tool_result"; data: { step: number; action: string; args: Record<string, string>; ok: boolean; url: string; title?: string; blocked?: unknown; error?: string; extractedPreview?: string } }
-  | { event: "retry_prompt"; data: { step: number; attempt: number; maxAttempts: number; reason: string } }
-  | { event: "finish_rejected"; data: { step: number; prematureFinishRejections: number; fallback: string | null } }
-  | { event: "finish"; data: { sessionId: string; objective: string; provider: LlmProviderId; summary: string; steps: unknown[]; stepsCount: number; finalUrl: string; screenshotDataUrl: string | null; completedAt: string } }
-  | { event: "error"; data: { message: string } };
-
-async function* runBrowserAgentSteps(input: BrowserAgentInput): AsyncGenerator<BrowserAgentEvent> {
-  const { objective, provider, sessionId, startUrl, maxSteps } = input;
-
-  const systemPrompt =
-    "Eres un agente autónomo de navegador web tipo Manus. Tu trabajo es COMPLETAR la tarea del usuario, no describirla. Tienes herramientas: navigate, click, type, scroll, extract, screenshot, finish.\n\n" +
-    "REGLAS DE FORMATO (críticas):\n" +
-    "1. Emite herramientas SOLO mediante el campo `tool_calls` de la API. Nunca como texto.\n" +
-    "2. PROHIBIDO `<function=...>`, `<tool_call>`, `<|python_tag|>`, `<navigate ...>`, `name{...}` u otras imitaciones textuales.\n" +
-    "3. PROHIBIDO inventar resultados, screenshots o navegaciones. Solo el resultado real de la tool cuenta.\n" +
-    "4. UNA tool_call por turno.\n\n" +
-    "REGLAS DE PERSISTENCIA (críticas):\n" +
-    "5. NO te rindas tras un fallo. Reintenta con estrategia DIFERENTE: otra URL, otro selector, otra herramienta, otro motor de búsqueda.\n" +
-    "6. Si Google bloquea con captcha (URL contiene /sorry/index o muestra reCAPTCHA), NO termines. El infraestructura tiene `solveCaptchas=true` activo — espera al re-extract automático. Si tras 2 intentos sigue bloqueado, usa una ALTERNATIVA inmediatamente.\n" +
-    "7. ALTERNATIVAS de búsqueda (sin captcha): `https://duckduckgo.com/?q=...`, `https://html.duckduckgo.com/html/?q=...` (versión sin JS, robusta), `https://www.bing.com/search?q=...`, `https://search.brave.com/search?q=...`. Úsalas SIN preguntar cuando Google falle.\n" +
-    "8. Si un selector CSS no funciona (timeout), prueba un selector más genérico (`input[type=text]`, `input[name=q]`, `textarea`, `button[type=submit]`). No abandones por un selector roto.\n" +
-    "9. Llama `finish` SOLO cuando: (a) la tarea esté demostrada por extract real, o (b) tras 4+ intentos diferentes haya quedado claro que es imposible. Nunca llames `finish` por el primer obstáculo.\n" +
-    "10. Si no sabes qué hacer, usa `extract` con selector `body` o `screenshot` para ver el estado real y replanificar.\n\n" +
-    "ESTRATEGIA estándar para 'busca X':\n" +
-    "  1) navigate a `https://duckduckgo.com/?q=X` (más fiable que Google)\n" +
-    "  2) extract con selector `[data-testid=\"result\"], .result, body` para ver resultados\n" +
-    "  3) finish con un summary que liste los hallazgos reales del extract\n\n" +
-    "Razona brevemente en español, luego emite la tool_call.";
-
-  yield { event: "start", data: { sessionId, objective, startUrl, maxSteps } };
-
-  const messages: LlmMessage[] = [
-    { role: "system", content: systemPrompt },
-    { role: "user", content: `Objetivo: ${objective}\nURL inicial: ${startUrl}` },
-  ];
-
-  const steps: unknown[] = [];
-  let currentUrl = startUrl;
-  let lastScreenshot = "";
-  let finalSummary = "";
-  let done = false;
-  let noToolCallRetries = 0;
-  let blockedCount = 0;
-  let successfulExtractCount = 0;
-  let prematureFinishRejections = 0;
-  const MAX_PREMATURE_FINISH_REJECTIONS = 2;
-  const triedFallbacks: string[] = [];
-
-  // Trim message history to keep LLM context (and latency) small.
-  const trimMessages = () => {
-    // Always keep system (idx 0) + initial user (idx 1). Keep last 6 turns after that.
-    if (messages.length > 12) {
-      const head = messages.slice(0, 2);
-      const tail = messages.slice(messages.length - 6);
-      messages.length = 0;
-      messages.push(...head, ...tail);
-    }
-  };
-  const SEARCH_FALLBACKS = [
-    "https://html.duckduckgo.com/html/?q=",
-    "https://duckduckgo.com/?q=",
-    "https://www.bing.com/search?q=",
-    "https://search.brave.com/search?q=",
-  ];
-  const pickNextFallback = (q: string): string | null => {
-    for (const base of SEARCH_FALLBACKS) {
-      if (!triedFallbacks.includes(base)) {
-        triedFallbacks.push(base);
-        return `${base}${encodeURIComponent(q)}`;
-      }
-    }
-    return null;
-  };
-
-  for (let step = 0; step < maxSteps && !done; step++) {
-    // Try with tool_choice: required first (forces real tool_call).
-    // On Groq "did not call a tool" error → retry with tool_choice: auto + text parser.
-    // On rate-limit error → sleep parsed seconds then retry once.
-    // When we've extracted enough data, skip the LLM entirely and synthesize
-    // a finish call so we always return useful data without burning more tokens.
-    const FORCE_FINISH_AT = 3;
-    const baseChoice: unknown = "required";
-    const callOnce = (toolChoice: unknown) =>
-      callOpenAiCompatibleProvider({
-        provider,
-        messages,
-        maxTokens: 200,
-        tools: BROWSER_TOOLS,
-        toolChoice,
-      });
-
-    trimMessages();
-    yield { event: "thought", data: { step: step + 1, status: "thinking" } };
-
-    const isNoToolError = (m: string) =>
-      /Failed to call a function|Tool choice is required|did not call a tool|no tool was called|Failed to parse tool call arguments|tool call validation failed/i.test(m);
-    const isRateLimit = (m: string) => /Rate limit reached|429/i.test(m);
-    const parseRetryAfterMs = (m: string): number => {
-      const sec = m.match(/try again in ([\d.]+)\s*s/i);
-      if (sec) return Math.min(20000, Math.ceil(parseFloat(sec[1]) * 1000) + 500);
-      return 3000;
-    };
-
-    // Helper: if Groq rejects because the model tried a different tool than
-    // the forced one, synthesize a finish call so we always return useful data.
-    const synthesizeFinish = (): Awaited<ReturnType<typeof callOpenAiCompatibleProvider>> => ({
-      provider,
-      model: "synthetic",
-      content: "",
-      finishReason: "stop",
-      toolCalls: [
-        {
-          id: `forced-${crypto.randomUUID()}`,
-          type: "function",
-          function: {
-            name: "finish",
-            arguments: JSON.stringify({
-              summary:
-                `Búsqueda completada. Se ejecutaron ${steps.length} pasos y ` +
-                `${successfulExtractCount} extracciones exitosas con datos reales.`,
-            }),
-          },
-        },
-      ] as never,
-    });
-
-    let llmResult: Awaited<ReturnType<typeof callOpenAiCompatibleProvider>>;
-    // Short-circuit: if we already have plenty of extractions, finish without
-    // calling the LLM. Saves tokens and avoids cycle/rate-limit spirals.
-    if (successfulExtractCount >= FORCE_FINISH_AT) {
-      llmResult = synthesizeFinish();
-    } else try {
-      llmResult = await callOnce(baseChoice);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (isRateLimit(msg)) {
-        await new Promise((r) => setTimeout(r, parseRetryAfterMs(msg)));
-        try {
-          llmResult = await callOnce(baseChoice);
-        } catch (err2) {
-          const msg2 = err2 instanceof Error ? err2.message : String(err2);
-          if (isNoToolError(msg2)) {
-            llmResult = await callOnce("auto").catch((e3) => {
-              throw new Error(`LLM error at step ${step + 1} (rate+auto): ${e3 instanceof Error ? e3.message : String(e3)}`);
-            });
-          } else {
-            throw new Error(`LLM error at step ${step + 1} (after rate retry): ${msg2}`);
-          }
-        }
-      } else if (isNoToolError(msg)) {
-        try {
-          llmResult = await callOnce("auto");
-        } catch (e3) {
-          const m3 = e3 instanceof Error ? e3.message : String(e3);
-          if (isNoToolError(m3) || isRateLimit(m3)) {
-            // Out of patience: synthesize a finish so user gets a result.
-            llmResult = synthesizeFinish();
-          } else {
-            throw new Error(`LLM error at step ${step + 1} (auto fallback): ${m3}`);
-          }
-        }
-      } else {
-        throw new Error(`LLM error at step ${step + 1}: ${msg}`);
-      }
-    }
-
-    let toolCalls = llmResult.toolCalls;
-    let parsedFromText = false;
-    const rawContent = llmResult.content ?? "";
-
-    // Fallback: if the model hallucinated tool calls as plain text, reparse.
-    if (!toolCalls || toolCalls.length === 0) {
-      const parsedToolCall = parseBrowserToolCallFromText(rawContent);
-      if (parsedToolCall) {
-        toolCalls = [parsedToolCall] as never;
-        parsedFromText = true;
-      }
-    }
-
-    if (!toolCalls || toolCalls.length === 0) {
-      // No tool call — treat as final text answer (sanitized)
-      if (noToolCallRetries < NO_TOOL_CALL_RETRY_LIMIT) {
-        noToolCallRetries += 1;
-        const retryMessage = buildNoToolCallRetryMessage({
-          objective,
-          currentUrl,
-          rawContent,
-          attempt: noToolCallRetries,
-          maxAttempts: NO_TOOL_CALL_RETRY_LIMIT,
-        });
-        messages.push({ role: "assistant", content: sanitizeAgentText(rawContent) });
-        messages.push({ role: "user", content: retryMessage });
-        steps.push({
-          step: step + 1,
-          action: "retry_prompt",
-          ok: false,
-          url: currentUrl,
-          reason: "missing_tool_call",
-        });
-        yield {
-          event: "retry_prompt",
-          data: { step: step + 1, attempt: noToolCallRetries, maxAttempts: NO_TOOL_CALL_RETRY_LIMIT, reason: "missing_tool_call" },
-        };
-        continue;
-      }
-
-      finalSummary =
-        sanitizeAgentText(rawContent) ||
-        `No pude completar la tarea porque el modelo dejo de emitir herramientas. URL final: ${currentUrl}`;
-      done = true;
-      break;
-    }
-
-    const toolCall = toolCalls[0];
-    const toolName: string = toolCall?.function?.name ?? "screenshot";
-    let toolArgs: Record<string, string> = {};
-    try {
-      toolArgs = JSON.parse(toolCall?.function?.arguments ?? "{}");
-    } catch (_) { /* ignore parse errors */ }
-
-    yield {
-      event: "tool_call",
-      data: { step: step + 1, action: toolName, args: toolArgs, parsedFromText },
-    };
-
-    if (toolName === "finish") {
-      const rawSummary = typeof toolArgs.summary === "string" ? toolArgs.summary : "";
-      // Reject premature finish: if agent is finishing without ever extracting
-      // useful data AND blocked count is low, force it to try alternatives.
-      const isPremature =
-        successfulExtractCount === 0 &&
-        blockedCount < 3 &&
-        prematureFinishRejections < MAX_PREMATURE_FINISH_REJECTIONS;
-      if (isPremature) {
-        prematureFinishRejections += 1;
-        const fallback = pickNextFallback(objective);
-        const coach =
-          `RECHAZADO: te rindes muy pronto. No has extraído datos reales todavía. ` +
-          `Intentos bloqueados: ${blockedCount}. Extracciones exitosas: ${successfulExtractCount}. ` +
-          `Reintentos rechazados: ${prematureFinishRejections}/${MAX_PREMATURE_FINISH_REJECTIONS}.\n\n` +
-          (fallback
-            ? `Usa esta alternativa AHORA con navigate: ${fallback}\nDespués extract con selector "body" para ver resultados, luego finish con los hallazgos reales.`
-            : `Cambia de estrategia: prueba otro selector, otra URL conocida del dominio, o haz scroll y extract de nuevo.`);
-        messages.push({ role: "assistant", content: sanitizeAgentText(rawContent) });
-        messages.push({ role: "user", content: coach });
-        steps.push({
-          step: step + 1,
-          action: "finish_rejected",
-          args: toolArgs,
-          url: currentUrl,
-          reason: "premature_finish_no_extract",
-          parsedFromText,
-        });
-        yield {
-          event: "finish_rejected",
-          data: { step: step + 1, prematureFinishRejections, fallback },
-        };
-        continue;
-      }
-
-      finalSummary = sanitizeAgentText(rawSummary) || "Tarea completada.";
-      done = true;
-
-      messages.push({
-        role: "assistant",
-        content: sanitizeAgentText(rawContent),
-      });
-      steps.push({ step: step + 1, action: "finish", args: toolArgs, url: currentUrl, parsedFromText });
-      break;
-    }
-
-    // Execute browser action
-    let observation = "";
-    let suggestion = "";
-    let toolResultEvent: BrowserAgentEvent | null = null;
-    try {
-      const browserResult = await executeBrowserAction(toolName, toolArgs, currentUrl);
-      currentUrl = browserResult.finalUrl || currentUrl;
-      lastScreenshot = browserResult.screenshotBase64;
-      if (browserResult.extracted && browserResult.extracted.length > 15) {
-        successfulExtractCount += 1;
-      }
-      if (browserResult.blocked) {
-        blockedCount += 1;
-        const fallback = pickNextFallback(objective);
-        suggestion = fallback
-          ? `\n\nESTE SITIO ESTÁ BLOQUEADO. NO te rindas. Llama navigate AHORA con esta URL alternativa: ${fallback}`
-          : `\n\nESTE SITIO ESTÁ BLOQUEADO y ya probaste las alternativas conocidas. Intenta una variante del query o un dominio especializado.`;
-      }
-      const screenshotKb = Math.round((lastScreenshot.length * 3) / 4 / 1024);
-      observation =
-        `Accion "${toolName}" ejecutada.\n` +
-        `URL actual: ${currentUrl}\n` +
-        `Titulo: ${browserResult.title}\n` +
-        (browserResult.blocked ? `Bloqueo externo detectado: ${browserResult.blocked.detail}\n` : "") +
-        (browserResult.extracted ? `Texto extraido: ${browserResult.extracted}\n` : "") +
-        `[Screenshot capturado (${screenshotKb} KB)]`;
-
-      steps.push({
-        step: step + 1,
-        action: toolName,
-        args: toolArgs,
-        url: currentUrl,
-        title: browserResult.title,
-        blocked: browserResult.blocked,
-        ok: true,
-        parsedFromText,
-      });
-      toolResultEvent = {
-        event: "tool_result",
-        data: {
-          step: step + 1,
-          action: toolName,
-          args: toolArgs,
-          ok: true,
-          url: currentUrl,
-          title: browserResult.title,
-          blocked: browserResult.blocked,
-          extractedPreview: typeof browserResult.extracted === "string" ? browserResult.extracted.slice(0, 200) : "",
-        },
-      };
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      observation = `Error ejecutando "${toolName}": ${errMsg}`;
-      // On selector timeout, hint at more generic selectors
-      if (/waiting for selector|Timeout|wait_for_selector/i.test(errMsg) && toolArgs.selector) {
-        suggestion =
-          `\n\nEl selector "${toolArgs.selector}" no aparece. Prueba selectores más genéricos: ` +
-          `input[name=q], input[type=search], input[type=text], textarea, button[type=submit]. ` +
-          `O usa extract con selector "body" para ver qué hay realmente en la página.`;
-      }
-      steps.push({ step: step + 1, action: toolName, args: toolArgs, ok: false, error: observation, parsedFromText });
-      toolResultEvent = {
-        event: "tool_result",
-        data: { step: step + 1, action: toolName, args: toolArgs, ok: false, url: currentUrl, error: errMsg },
-      };
-    }
-    if (toolResultEvent) yield toolResultEvent;
-
-    // Push neutral narration + observation. Avoid pseudo-syntax the model might parrot.
-    messages.push({
-      role: "assistant",
-      content: `Ejecuté la herramienta ${toolName}.`,
-    });
-    let guidance: string;
-    if (suggestion) {
-      guidance = `Resultado:\n${observation}${suggestion}\n\nEmite la siguiente tool_call AHORA.`;
-    } else if (successfulExtractCount >= 3) {
-      guidance =
-        `Resultado:\n${observation}\n\n` +
-        `Ya tienes ${successfulExtractCount} extracciones exitosas. ` +
-        `BASTA de extract — llama finish AHORA con un summary que resuma los datos reales obtenidos. ` +
-        `No repitas extracts con selectores similares.`;
-    } else if (successfulExtractCount >= 1 && toolName === "extract") {
-      guidance =
-        `Resultado:\n${observation}\n\n` +
-        `Tienes datos. Si son suficientes para responder el objetivo, llama finish. ` +
-        `Si necesitas más detalle de OTRA parte de la página, usa un selector DIFERENTE (no repitas el último).`;
-    } else {
-      guidance =
-        `Resultado:\n${observation}\n\n` +
-        `Si tienes datos suficientes, llama finish con resumen real. ` +
-        `Si no, emite la siguiente tool_call (no te rindas).`;
-    }
-    messages.push({ role: "user", content: guidance });
-  }
-
-  finalSummary = sanitizeAgentText(finalSummary);
-  if (!finalSummary) {
-    finalSummary = steps.length > 0
-      ? `No pude confirmar que la tarea terminara antes de agotar los pasos disponibles. URL final: ${currentUrl}`
-      : "No pude completar la tarea: no se ejecuto ninguna accion del navegador.";
-  }
-
-  const finalPayload = {
-    sessionId,
-    objective,
-    summary: finalSummary,
-    steps,
-    stepsCount: steps.length,
-    finalUrl: currentUrl,
-    screenshotDataUrl: lastScreenshot ? `data:image/png;base64,${lastScreenshot}` : null,
-    provider,
-    completedAt: new Date().toISOString(),
-  };
-
-  await redis.set(`okm:agent:browser:${sessionId}`, JSON.stringify({ ...finalPayload, screenshotDataUrl: undefined }), { EX: 3600 });
-
-  yield { event: "finish", data: finalPayload };
-}
-
-function parseBrowserAgentBody(body: Record<string, unknown>): { ok: true; input: BrowserAgentInput } | { ok: false; error: string; status: number } {
-  const objective = stringField(body.objective ?? body.prompt, "");
-  if (!objective) return { ok: false, error: "objective is required", status: 400 };
-  const provider = normalizeLlmProvider(body.provider);
-  const sessionId = stringField(body.sessionId, `agent-${crypto.randomUUID()}`);
-  const startUrl = stringField(body.url, DEFAULT_BROWSER_START_URL);
-  const maxSteps = Math.min(numberField(body.maxSteps, REACT_MAX_STEPS, 1, REACT_MAX_STEPS), REACT_MAX_STEPS);
-  return { ok: true, input: { objective, provider, sessionId, startUrl, maxSteps } };
-}
-
 app.post("/v1/agent/browser/run", async ({ request }) => {
-  if (!browserlessApiKey) return makeJsonResponse({ error: "BROWSERLESS_API_KEY is not configured" }, 503);
-
-  const body = await readJsonObject(request).catch(() => ({}));
-  const parsed = parseBrowserAgentBody(body);
-  if (!parsed.ok) return makeJsonResponse({ error: parsed.error }, parsed.status);
-
-  let finalPayload: unknown = null;
-  for await (const evt of runBrowserAgentSteps(parsed.input)) {
-    if (evt.event === "finish") finalPayload = evt.data;
-  }
-  return finalPayload ?? { error: "agent did not produce a result" };
+  void request;
+  return makeJsonResponse(
+    {
+      error: "Browser agents moved to okmanus-apis",
+      service: "okmanus-apis",
+      replacement: "/v1/agents/run",
+    },
+    410,
+  );
 });
-
-function sseFrame(event: string, data: unknown): string {
-  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-}
 
 app.post("/v1/agent/browser/stream", async ({ request }) => {
-  if (!browserlessApiKey) return makeJsonResponse({ error: "BROWSERLESS_API_KEY is not configured" }, 503);
-
-  const body = await readJsonObject(request).catch(() => ({}));
-  const parsed = parseBrowserAgentBody(body);
-  if (!parsed.ok) return makeJsonResponse({ error: parsed.error }, parsed.status);
-
-  const encoder = new TextEncoder();
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const write = (chunk: string) => controller.enqueue(encoder.encode(chunk));
-      try {
-        for await (const evt of runBrowserAgentSteps(parsed.input)) {
-          write(sseFrame(evt.event, evt.data));
-        }
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        write(sseFrame("error", { message }));
-      } finally {
-        write("data: [DONE]\n\n");
-        controller.close();
-      }
+  void request;
+  return makeJsonResponse(
+    {
+      error: "Browser agent streaming moved to okmanus-apis",
+      service: "okmanus-apis",
+      replacement: "/v1/agents/run",
     },
-  });
-
-  return new Response(stream, {
-    headers: {
-      ...productCorsHeaders,
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache, no-transform",
-      "connection": "keep-alive",
-      "x-accel-buffering": "no",
-    },
-  });
+    410,
+  );
 });
-
 app.post("/v1/computer/browserless/action", async ({ request }) => {
   if (!browserlessApiKey) return makeJsonResponse({ error: "BROWSERLESS_API_KEY is not configured" }, 503);
 
