@@ -4,6 +4,7 @@ import { Elysia } from "elysia";
 import { createClient } from "redis";
 import type { RedisClientType } from "redis";
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 
 // Argumento de un comando Redis: string o datos binarios
 type RedisArg = string | Buffer;
@@ -60,6 +61,14 @@ const productClientToken = process.env.OKMANUS_PRODUCT_CLIENT_TOKEN;
 const appwriteEndpoint = process.env.APPWRITE_ENDPOINT?.replace(/\/$/, "");
 const appwriteProjectId = process.env.APPWRITE_PROJECT_ID;
 const requireAppwriteSession = process.env.OKMANUS_REQUIRE_APPWRITE_SESSION === "true";
+const insforgeBaseUrl = process.env.INSFORGE_BASE_URL?.replace(/\/$/, "") ?? "https://wn29rvfu.eu-central.insforge.app";
+const insforgeServiceKey =
+  process.env.INSFORGE_SERVICE_KEY ??
+  process.env.INSFORGE_API_KEY ??
+  process.env.INSFORGE_ANON_KEY;
+const insforgeArchiveRpcUrl =
+  process.env.INSFORGE_ARCHIVE_RPC_URL ??
+  (insforgeBaseUrl ? `${insforgeBaseUrl}/rest/v1/rpc/archive_okmanus_chat_session` : "");
 const browserlessApiKey = process.env.BROWSERLESS_API_KEY;
 const browserlessEndpoint = (process.env.BROWSERLESS_ENDPOINT ?? "https://production-sfo.browserless.io").replace(/\/$/, "");
 const mcpRegistryTtlSeconds = Number(process.env.MCP_REGISTRY_TTL_SECONDS ?? 3600);
@@ -978,6 +987,24 @@ function optionalStringField(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function isUuid(value: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function stableUuidFromString(value: string) {
+  const bytes = createHash("sha256").update(value).digest().subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function resolveArchiveUserId(body: Record<string, unknown>, actorUserId: string) {
+  const explicit = optionalStringField(body.insforgeUserId ?? body.user_id ?? body.userId);
+  if (explicit && isUuid(explicit)) return explicit;
+  return stableUuidFromString(actorUserId);
+}
+
 function jsonField(value: unknown) {
   return JSON.stringify(value && typeof value === "object" ? value : {});
 }
@@ -1247,6 +1274,97 @@ function serializeRedisStream(reply: RedisReply) {
       event: JSON.parse(eventJson),
     };
   });
+}
+
+async function getSessionManifest(sessionId: string) {
+  return parseRedisHash(await sendRedisCommand(["HGETALL", sessionKey(sessionId)]) as RedisReply);
+}
+
+async function getSessionJobIds(sessionId: string, count: number) {
+  return parseRedisArray(await sendRedisCommand(["LRANGE", sessionJobsKey(sessionId), "0", String(count - 1)]) as RedisReply);
+}
+
+async function buildArchiveMessages(jobIds: string[]) {
+  const jobs = (await Promise.all(jobIds.map((jobId) => getJob(jobId)))).filter(Boolean) as Array<ReturnType<typeof serializeJob>>;
+  const messages = await Promise.all(
+    jobs.map(async (job) => {
+      const eventsReply = await sendRedisCommand(["XRANGE", jobEventsKey(job.job_id), "-", "+", "COUNT", "200"]) as RedisReply;
+      return {
+        external_job_id: job.job_id,
+        external_event_id: `${job.job_id}:prompt`,
+        role: "user",
+        content: job.prompt || JSON.stringify(job.target),
+        tool_calls: {
+          status: job.status,
+          queue: job.queue,
+          plan: job.plan,
+          taskType: job.task_type,
+          target: job.target,
+          runtime: job.runtime,
+          artifacts: job.artifacts,
+          verification: job.verification,
+        },
+        sandbox_steps: serializeRedisStream(eventsReply),
+        created_at: job.created_at,
+      };
+    }),
+  );
+
+  return { jobs, messages };
+}
+
+async function archiveSessionInInsforge(input: {
+  userId: string;
+  appwriteUserId: string;
+  sessionId: string;
+  workspaceId: string;
+  title: string;
+  model: string;
+  messages: unknown[];
+}) {
+  if (!insforgeArchiveRpcUrl || !insforgeServiceKey) {
+    throw new Error("Insforge archive is not configured");
+  }
+
+  const response = await fetch(insforgeArchiveRpcUrl, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      apikey: insforgeServiceKey,
+      authorization: `Bearer ${insforgeServiceKey}`,
+    },
+    body: JSON.stringify({
+      p_user_id: input.userId,
+      p_appwrite_user_id: input.appwriteUserId,
+      p_session_id: input.sessionId,
+      p_workspace_id: input.workspaceId,
+      p_title: input.title,
+      p_model: input.model,
+      p_messages: input.messages,
+    }),
+  });
+
+  const data = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new Error(data?.message ?? data?.error ?? `Insforge archive failed: ${response.status}`);
+  }
+
+  return Array.isArray(data) ? data[0] : data;
+}
+
+async function deleteArchivedSessionFromRedis(sessionId: string, jobIds: string[], userId: string) {
+  const commands: Command[] = [
+    ["DEL", sessionKey(sessionId)],
+    ["DEL", sessionJobsKey(sessionId)],
+  ];
+
+  for (const jobId of jobIds) {
+    commands.push(["DEL", jobKey(jobId)]);
+    commands.push(["DEL", jobEventsKey(jobId)]);
+    commands.push(["SREM", userJobsKey(userId), jobId]);
+  }
+
+  await executePipeline(commands);
 }
 
 async function getProductActor(request: Request) {
@@ -1529,6 +1647,47 @@ app.get("/v1/sessions/:sessionId/jobs", async ({ params }) => {
   return {
     sessionId,
     jobs: jobs.filter(Boolean),
+  };
+});
+
+app.post("/v1/sessions/:sessionId/archive", async ({ request, params }) => {
+  const actor = await getProductActor(request);
+  const body = await readJsonObject(request);
+  const sessionId = normalizeRedisId(params.sessionId, "sess");
+  const count = numberField(body.count, 100, 1, 500);
+  const clearRedis = body.clearRedis === true;
+  const session = await getSessionManifest(sessionId);
+  const jobIds = await getSessionJobIds(sessionId, count);
+  if (!jobIds.length) return makeJsonResponse({ error: "No Redis jobs found for session" }, 404);
+
+  const { jobs, messages } = await buildArchiveMessages(jobIds);
+  const workspaceId = stringField(body.workspaceId, session.workspaceId || jobs[0]?.workspace_id || "workspace");
+  const title = stringField(body.title, jobs[0]?.prompt || "OkManus conversation").slice(0, 160);
+  const model = stringField(body.model, jobs[0]?.runtime && typeof jobs[0].runtime === "object" ? String((jobs[0].runtime as Record<string, unknown>).model ?? "") : "");
+  const appwriteUserId = actor.userId;
+  const userId = resolveArchiveUserId(body, appwriteUserId);
+
+  const archived = await archiveSessionInInsforge({
+    userId,
+    appwriteUserId,
+    sessionId,
+    workspaceId,
+    title,
+    model,
+    messages,
+  });
+
+  if (clearRedis) {
+    await deleteArchivedSessionFromRedis(sessionId, jobIds, actor.userId);
+  }
+
+  return {
+    archived,
+    sessionId,
+    userId,
+    appwriteUserId,
+    messages: messages.length,
+    redisCleared: clearRedis,
   };
 });
 
