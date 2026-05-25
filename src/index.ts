@@ -53,7 +53,7 @@ const redisLocalPressureReadWeight = Number(process.env.REDIS_LOCAL_PRESSURE_REA
 const redisCloudPressureReadWeight = Number(process.env.REDIS_CLOUD_PRESSURE_READ_WEIGHT ?? 6);
 const upstashPressureReadWeight = Number(process.env.UPSTASH_REDIS_PRESSURE_READ_WEIGHT ?? 2);
 const mirrorWrites = process.env.REDIS_MIRROR_WRITES !== "false";
-const vpsMemoryOffloadBytes = Number(process.env.VPS_MEMORY_OFFLOAD_BYTES ?? 5 * 1024 * 1024 * 1024);
+const vpsMemoryOffloadBytes = Number(process.env.VPS_MEMORY_OFFLOAD_BYTES ?? 5_000_000_000);
 // Cuando es true, habilita comandos peligrosos como FLUSHDB, CONFIG, SHUTDOWN (default: false)
 const allowDangerousCommands = process.env.OKMANUS_ALLOW_DANGEROUS_COMMANDS === "true";
 const productClientToken = process.env.OKMANUS_PRODUCT_CLIENT_TOKEN;
