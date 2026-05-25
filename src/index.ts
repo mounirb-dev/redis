@@ -3,6 +3,7 @@ import { Elysia } from "elysia";
 // Cliente oficial de Redis para Node.js/Bun
 import { createClient } from "redis";
 import type { RedisClientType } from "redis";
+import { readFileSync } from "node:fs";
 
 // Argumento de un comando Redis: string o datos binarios
 type RedisArg = string | Buffer;
@@ -10,6 +11,13 @@ type RedisArg = string | Buffer;
 type RedisReply = string | number | bigint | null | Buffer | RedisReply[];
 // Un comando Redis es un array de argumentos, ej: ["SET", "clave", "valor"]
 type Command = RedisArg[];
+type RedisBackend = {
+  name: string;
+  client: RedisClientType;
+  normalReadWeight: number;
+  pressureReadWeight: number;
+  mirrorWrites: boolean;
+};
 // Respuesta estándar de la API REST: siempre tiene `result` o `error`
 type RestResult = { result: unknown } | { error: string };
 // Bucket de rate limit por cliente: peticiones hechas y cuándo se reinicia
@@ -38,6 +46,14 @@ const commandTimeoutMs = Number(process.env.COMMAND_TIMEOUT_MS ?? 5_000);
 const maxInFlightCommands = Number(process.env.MAX_IN_FLIGHT_COMMANDS ?? 50);
 // Cola interna del cliente Redis; 10x el límite de in-flight para absorber ráfagas
 const redisCommandQueueMaxLength = Number(process.env.REDIS_COMMAND_QUEUE_MAX_LENGTH ?? maxInFlightCommands * 10);
+const redisLocalReadWeight = Number(process.env.REDIS_LOCAL_READ_WEIGHT ?? 8);
+const redisCloudReadWeight = Number(process.env.REDIS_CLOUD_READ_WEIGHT ?? 3);
+const upstashReadWeight = Number(process.env.UPSTASH_REDIS_READ_WEIGHT ?? 1);
+const redisLocalPressureReadWeight = Number(process.env.REDIS_LOCAL_PRESSURE_READ_WEIGHT ?? 1);
+const redisCloudPressureReadWeight = Number(process.env.REDIS_CLOUD_PRESSURE_READ_WEIGHT ?? 6);
+const upstashPressureReadWeight = Number(process.env.UPSTASH_REDIS_PRESSURE_READ_WEIGHT ?? 2);
+const mirrorWrites = process.env.REDIS_MIRROR_WRITES !== "false";
+const vpsMemoryOffloadBytes = Number(process.env.VPS_MEMORY_OFFLOAD_BYTES ?? 5 * 1024 * 1024 * 1024);
 // Cuando es true, habilita comandos peligrosos como FLUSHDB, CONFIG, SHUTDOWN (default: false)
 const allowDangerousCommands = process.env.OKMANUS_ALLOW_DANGEROUS_COMMANDS === "true";
 const productClientToken = process.env.OKMANUS_PRODUCT_CLIENT_TOKEN;
@@ -246,23 +262,70 @@ setInterval(() => {
 // - disableOfflineQueue: falla inmediato si Redis no está conectado (no acumula peticiones)
 // - reconnectStrategy: backoff exponencial, máximo 500ms entre reintentos
 // - pingInterval: keepalive cada 30s para detectar conexiones muertas
-const redis = createClient({
-  url: redisUrl,
-  commandsQueueMaxLength: redisCommandQueueMaxLength,
-  disableOfflineQueue: true,
-  socket: {
-    reconnectStrategy: (retries) => Math.min(retries * 50, 500),
-  },
-  pingInterval: 30_000,
-}) as RedisClientType;
+function createRedisBackendClient(name: string, url: string) {
+  const client = createClient({
+    url,
+    commandsQueueMaxLength: redisCommandQueueMaxLength,
+    disableOfflineQueue: true,
+    socket: {
+      reconnectStrategy: (retries) => Math.min(retries * 50, 500),
+    },
+    pingInterval: 30_000,
+  }) as RedisClientType;
+
+  client.on("error", (error) => {
+    console.error(`Redis ${name} error:`, error);
+  });
+
+  return client;
+}
 
 // Log de errores Redis sin crashear el proceso
-redis.on("error", (error) => {
-  console.error("Redis error:", error);
-});
+const redis = createRedisBackendClient("primary", redisUrl);
 
 // Conexión inicial; await en top-level (soportado en Bun y Node.js ESM moderno)
 await redis.connect();
+
+const redisBackends: RedisBackend[] = [
+  {
+    name: "primary",
+    client: redis,
+    normalReadWeight: Math.max(0, redisLocalReadWeight),
+    pressureReadWeight: Math.max(0, redisLocalPressureReadWeight),
+    mirrorWrites: false,
+  },
+];
+
+async function connectOptionalRedisBackend(
+  name: string,
+  url: string | undefined,
+  normalReadWeight: number,
+  pressureReadWeight: number,
+) {
+  if (!url?.trim()) return;
+
+  const client = createRedisBackendClient(name, url.trim());
+  try {
+    await client.connect();
+    redisBackends.push({
+      name,
+      client,
+      normalReadWeight: Math.max(0, normalReadWeight),
+      pressureReadWeight: Math.max(0, pressureReadWeight),
+      mirrorWrites,
+    });
+    console.log(`Redis ${name} backend connected`);
+  } catch (error) {
+    console.error(`Redis ${name} backend disabled:`, error);
+  }
+}
+
+await Promise.all([
+  connectOptionalRedisBackend("redis-cloud", process.env.REDIS_CLOUD_URL, redisCloudReadWeight, redisCloudPressureReadWeight),
+  connectOptionalRedisBackend("upstash", process.env.UPSTASH_REDIS_URL, upstashReadWeight, upstashPressureReadWeight),
+]);
+
+let readBackendCursor = 0;
 
 async function seedPlatformRegistry() {
   const manifest = buildBootstrapManifest();
@@ -667,6 +730,115 @@ function formatError(error: unknown): { error: string } {
   return { error: message };
 }
 
+function getHostMemoryUsedBytes() {
+  try {
+    const meminfo = readFileSync("/proc/meminfo", "utf8");
+    const total = Number(meminfo.match(/^MemTotal:\s+(\d+)/m)?.[1] ?? 0) * 1024;
+    const available = Number(meminfo.match(/^MemAvailable:\s+(\d+)/m)?.[1] ?? 0) * 1024;
+    if (total > 0 && available > 0) return total - available;
+  } catch {
+    // Windows/local tests and restricted containers may not expose /proc/meminfo.
+  }
+
+  return process.memoryUsage().rss;
+}
+
+function isMemoryPressureMode() {
+  return getHostMemoryUsedBytes() >= vpsMemoryOffloadBytes;
+}
+
+function isReadCommand(command: Command) {
+  return readOnlyCommands.has(commandName(command));
+}
+
+function readPool() {
+  const pressureMode = isMemoryPressureMode();
+  const pool: RedisBackend[] = [];
+
+  for (const backend of redisBackends) {
+    if (!backend.client.isReady) continue;
+    const weight = pressureMode ? backend.pressureReadWeight : backend.normalReadWeight;
+    for (let i = 0; i < weight; i += 1) pool.push(backend);
+  }
+
+  return pool.length ? pool : redisBackends.filter((backend) => backend.client.isReady);
+}
+
+async function sendReadCommand(command: Command): Promise<RedisReply> {
+  const pool = readPool();
+  const errors: unknown[] = [];
+
+  for (let i = 0; i < pool.length; i += 1) {
+    const backend = pool[(readBackendCursor + i) % pool.length];
+    try {
+      readBackendCursor = (readBackendCursor + i + 1) % pool.length;
+      return await withTimeout(backend.client.sendCommand(command) as Promise<RedisReply>);
+    } catch (error) {
+      errors.push(error);
+      console.error(`Redis ${backend.name} read failed:`, error);
+    }
+  }
+
+  throw errors[0] ?? new Error("ERR no Redis backend available");
+}
+
+async function mirrorWrite(command: Command) {
+  await Promise.allSettled(
+    redisBackends.map(async (backend) => {
+      if (!backend.mirrorWrites || !backend.client.isReady) return;
+      try {
+        await withTimeout(backend.client.sendCommand(command) as Promise<RedisReply>);
+      } catch (error) {
+        console.error(`Redis ${backend.name} mirror failed:`, error);
+      }
+    }),
+  );
+}
+
+async function sendRedisCommand(command: Command): Promise<RedisReply> {
+  if (isReadCommand(command)) return sendReadCommand(command);
+
+  const reply = await withTimeout(redis.sendCommand(command) as Promise<RedisReply>);
+  await mirrorWrite(command);
+  return reply;
+}
+
+async function redisHealthSnapshot() {
+  const pressureMode = isMemoryPressureMode();
+  const usedBytes = getHostMemoryUsedBytes();
+  const backends = await Promise.all(
+    redisBackends.map(async (backend) => {
+      try {
+        const pong = await withTimeout(backend.client.ping());
+        return {
+          name: backend.name,
+          ready: backend.client.isReady,
+          ping: pong,
+          readWeight: pressureMode ? backend.pressureReadWeight : backend.normalReadWeight,
+          mirrorWrites: backend.mirrorWrites,
+        };
+      } catch (error) {
+        return {
+          name: backend.name,
+          ready: false,
+          error: error instanceof Error ? error.message : String(error),
+          readWeight: pressureMode ? backend.pressureReadWeight : backend.normalReadWeight,
+          mirrorWrites: backend.mirrorWrites,
+        };
+      }
+    }),
+  );
+
+  return {
+    pressureMode,
+    memory: {
+      usedBytes,
+      offloadAtBytes: vpsMemoryOffloadBytes,
+    },
+    backends,
+  };
+}
+
 // Ejecuta un comando Redis individual con control de concurrencia y timeout
 // inFlightCommands se decrementa en finally para garantizar limpieza aunque haya error
 async function executeCommand(command: Command): Promise<RedisReply> {
@@ -678,7 +850,7 @@ async function executeCommand(command: Command): Promise<RedisReply> {
 
   inFlightCommands += 1;
   try {
-    return await withTimeout(redis.sendCommand(command) as Promise<RedisReply>);
+    return await sendRedisCommand(command);
   } finally {
     inFlightCommands -= 1;
   }
@@ -709,7 +881,7 @@ async function executePipeline(commands: Command[]): Promise<RestResult[]> {
         if ("error" in slot) return formatError(slot.error);
 
         try {
-          const reply = await withTimeout(redis.sendCommand(slot.command) as Promise<RedisReply>);
+          const reply = await sendRedisCommand(slot.command);
           return { result: toJsonValue(reply, false) };
         } catch (error) {
           return formatError(error);
@@ -742,6 +914,7 @@ async function executeTransaction(commands: Command[]): Promise<RestResult[] | {
 
     try {
       const replies = await withTimeout(multi.exec() as Promise<RedisReply[]>);
+      await Promise.all(commands.map((command) => mirrorWrite(command)));
       return replies.map((reply) => ({ result: toJsonValue(reply, false) }));
     } finally {
       inFlightCommands -= commands.length;
@@ -971,7 +1144,7 @@ async function scanKeys(match: string, count = 100) {
   let cursor = "0";
 
   do {
-    const reply = await redis.sendCommand(["SCAN", cursor, "MATCH", match, "COUNT", String(count)]) as RedisReply[];
+    const reply = await sendRedisCommand(["SCAN", cursor, "MATCH", match, "COUNT", String(count)]) as RedisReply[];
     cursor = String(reply[0] ?? "0");
     keys.push(...parseRedisArray(reply[1] as RedisReply));
   } while (cursor !== "0" && keys.length < count);
@@ -980,13 +1153,13 @@ async function scanKeys(match: string, count = 100) {
 }
 
 async function getJsonValue<T>(key: string): Promise<T | null> {
-  const value = await redis.sendCommand(["GET", key]) as RedisReply;
+  const value = await sendRedisCommand(["GET", key]) as RedisReply;
   if (typeof value !== "string") return null;
   return JSON.parse(value) as T;
 }
 
 async function setJsonValue(key: string, value: unknown, ttlSeconds: number) {
-  await redis.sendCommand(["SET", key, JSON.stringify(value), "EX", String(ttlSeconds)]);
+  await sendRedisCommand(["SET", key, JSON.stringify(value), "EX", String(ttlSeconds)]);
 }
 
 function jobKey(jobId: string) {
@@ -1038,14 +1211,14 @@ function serializeJob(hash: Record<string, string>) {
 }
 
 async function getJob(jobId: string) {
-  const hash = parseRedisHash(await redis.sendCommand(["HGETALL", jobKey(jobId)]) as RedisReply);
+  const hash = parseRedisHash(await sendRedisCommand(["HGETALL", jobKey(jobId)]) as RedisReply);
   if (!hash.jobId) return null;
   return serializeJob(hash);
 }
 
 async function appendJobEvent(jobId: string, event: Record<string, unknown>, ttlSeconds = okmanusJobTtlSeconds) {
   const key = jobEventsKey(jobId);
-  await redis.sendCommand([
+  await sendRedisCommand([
     "XADD",
     key,
     "MAXLEN",
@@ -1059,7 +1232,7 @@ async function appendJobEvent(jobId: string, event: Record<string, unknown>, ttl
       createdAt: new Date().toISOString(),
     }),
   ]);
-  await redis.sendCommand(["EXPIRE", key, String(ttlSeconds)]);
+  await sendRedisCommand(["EXPIRE", key, String(ttlSeconds)]);
 }
 
 function serializeRedisStream(reply: RedisReply) {
@@ -1109,7 +1282,7 @@ async function ensureSessionManifest(input: {
 
 async function appendMcpEvent(mcpId: string, workspaceId: string, event: Record<string, unknown>) {
   const streamKey = `okm:mcp:${mcpId}:stream:${workspaceId}`;
-  await redis.sendCommand([
+  await sendRedisCommand([
     "XADD",
     streamKey,
     "MAXLEN",
@@ -1124,7 +1297,7 @@ async function appendMcpEvent(mcpId: string, workspaceId: string, event: Record<
       createdAt: new Date().toISOString(),
     }),
   ]);
-  await redis.sendCommand(["EXPIRE", streamKey, String(mcpRegistryTtlSeconds)]);
+  await sendRedisCommand(["EXPIRE", streamKey, String(mcpRegistryTtlSeconds)]);
 }
 
 function buildBootstrapManifest() {
@@ -1257,11 +1430,13 @@ app.onBeforeHandle(async ({ request }) => {
 // Endpoint de health check: hace PING a Redis y devuelve estado + configuración activa
 app.get("/health", async () => {
   try {
-    const pong = await redis.ping();
+    const redisHealth = await redisHealthSnapshot();
+    const connected = redisHealth.backends.some((backend) => backend.ready && backend.ping === "PONG");
     return {
-      status: "healthy",
-      redis: pong === "PONG" ? "connected" : "unknown",
+      status: connected ? "healthy" : "unhealthy",
+      redis: connected ? "connected" : "unknown",
       upstashCompatible: true,
+      redisBalancer: redisHealth,
       limits: {
         rateLimitMaxRequests,
         rateLimitWindowSeconds: Math.floor(rateLimitWindowMs / 1000),
@@ -1291,12 +1466,14 @@ app.get("/", () => ({
 }));
 
 app.get("/v1/health", async () => {
-  const pong = await redis.ping();
+  const redisHealth = await redisHealthSnapshot();
+  const connected = redisHealth.backends.some((backend) => backend.ready && backend.ping === "PONG");
   return {
-    status: "healthy",
-    redis: pong === "PONG" ? "connected" : "unknown",
+    status: connected ? "healthy" : "unhealthy",
+    redis: connected ? "connected" : "unknown",
+    redisBalancer: redisHealth,
     services: {
-      redis: "connected",
+      redis: connected ? "connected" : "unknown",
       browserless: browserlessApiKey ? "configured" : "missing_credentials",
     },
     timestamp: new Date().toISOString(),
@@ -1305,7 +1482,7 @@ app.get("/v1/health", async () => {
 
 app.get("/v1/bootstrap", async () => {
   const manifest = buildBootstrapManifest();
-  await redis.set("okm:registry:bootstrap", JSON.stringify(manifest), { EX: manifest.ttlSeconds });
+  await sendRedisCommand(["SET", "okm:registry:bootstrap", JSON.stringify(manifest), "EX", String(manifest.ttlSeconds)]);
   return manifest;
 });
 
@@ -1347,7 +1524,7 @@ app.post("/v1/sessions", async ({ request }) => {
 
 app.get("/v1/sessions/:sessionId/jobs", async ({ params }) => {
   const sessionId = normalizeRedisId(params.sessionId, "sess");
-  const jobIds = parseRedisArray(await redis.sendCommand(["LRANGE", sessionJobsKey(sessionId), "0", "99"]) as RedisReply);
+  const jobIds = parseRedisArray(await sendRedisCommand(["LRANGE", sessionJobsKey(sessionId), "0", "99"]) as RedisReply);
   const jobs = await Promise.all(jobIds.map((jobId) => getJob(jobId)));
   return {
     sessionId,
@@ -1394,7 +1571,7 @@ app.post("/v1/jobs", async ({ request }) => {
 
   const userJobs = userJobsKey(actor.userId);
   const sessionJobs = sessionJobsKey(sessionId);
-  const queueLength = Number(await redis.sendCommand(["LLEN", queue]) ?? 0);
+  const queueLength = Number(await sendRedisCommand(["LLEN", queue]) ?? 0);
   if (queueLength >= okmanusQueueMaxJobs) {
     return makeJsonResponse({ error: `Queue ${queue} is full` }, 429);
   }
@@ -1446,8 +1623,8 @@ app.get("/v1/jobs", async ({ request }) => {
   const count = numberField(url.searchParams.get("count"), 50, 1, 100);
   const sourceKey = sessionId ? sessionJobsKey(normalizeRedisId(sessionId, "sess")) : userJobsKey(actor.userId);
   const ids = sessionId
-    ? parseRedisArray(await redis.sendCommand(["LRANGE", sourceKey, "0", String(count - 1)]) as RedisReply)
-    : parseRedisArray(await redis.sendCommand(["SMEMBERS", sourceKey]) as RedisReply).slice(0, count);
+    ? parseRedisArray(await sendRedisCommand(["LRANGE", sourceKey, "0", String(count - 1)]) as RedisReply)
+    : parseRedisArray(await sendRedisCommand(["SMEMBERS", sourceKey]) as RedisReply).slice(0, count);
   const jobs = await Promise.all(ids.map((jobId) => getJob(jobId)));
 
   return {
@@ -1467,7 +1644,7 @@ app.get("/v1/jobs/:jobId/events", async ({ request, params }) => {
   const jobId = normalizeRedisId(params.jobId, "job");
   const url = new URL(request.url);
   const count = numberField(url.searchParams.get("count"), 100, 1, 500);
-  const reply = await redis.sendCommand(["XRANGE", jobEventsKey(jobId), "-", "+", "COUNT", String(count)]) as RedisReply;
+  const reply = await sendRedisCommand(["XRANGE", jobEventsKey(jobId), "-", "+", "COUNT", String(count)]) as RedisReply;
   return {
     job_id: jobId,
     events: serializeRedisStream(reply),
@@ -1480,7 +1657,7 @@ app.post("/v1/jobs/:jobId/cancel", async ({ params }) => {
   if (!job) return makeJsonResponse({ error: "Job not found" }, 404);
 
   const updatedAt = new Date().toISOString();
-  await redis.sendCommand(["HSET", jobKey(jobId), "status", "cancelled", "updatedAt", updatedAt]);
+  await sendRedisCommand(["HSET", jobKey(jobId), "status", "cancelled", "updatedAt", updatedAt]);
   await appendJobEvent(jobId, { type: "job.cancelled", status: "cancelled" });
   return { job_id: jobId, status: "cancelled", updated_at: updatedAt };
 });
@@ -1509,12 +1686,12 @@ app.post("/v1/queues/:plan/:taskType/:region/next", async ({ params }) => {
   const taskType = normalizeRedisId(params.taskType, "task");
   const region = normalizeRedisId(params.region, "global");
   const queue = jobQueueKey(plan, taskType, region);
-  const jobId = String((await redis.sendCommand(["LPOP", queue]) as RedisReply) ?? "");
+  const jobId = String((await sendRedisCommand(["LPOP", queue]) as RedisReply) ?? "");
 
   if (!jobId) return { job: null, queue };
 
   const updatedAt = new Date().toISOString();
-  await redis.sendCommand(["HSET", jobKey(jobId), "status", "leased", "updatedAt", updatedAt]);
+  await sendRedisCommand(["HSET", jobKey(jobId), "status", "leased", "updatedAt", updatedAt]);
   await appendJobEvent(jobId, { type: "job.leased", status: "leased", queue });
   return {
     queue,
@@ -1750,7 +1927,7 @@ app.get("/v1/mcps/:mcpId/events", async ({ request, params }) => {
   const workspaceId = normalizeRedisId(url.searchParams.get("workspaceId"), "workspace");
   const count = numberField(url.searchParams.get("count"), 50, 1, 200);
   const streamKey = `okm:mcp:${mcpId}:stream:${workspaceId}`;
-  const reply = await redis.sendCommand(["XRANGE", streamKey, "-", "+", "COUNT", String(count)]) as RedisReply[];
+  const reply = await sendRedisCommand(["XRANGE", streamKey, "-", "+", "COUNT", String(count)]) as RedisReply[];
   const events = reply.map((entry) => {
     const [id, fields] = Array.isArray(entry) ? entry : [];
     const fieldList = parseRedisArray(fields as RedisReply);
@@ -1796,7 +1973,7 @@ app.post("/v1/computer/browserless", async ({ request }) => {
     capturedAt: new Date().toISOString(),
   };
 
-  await redis.set("okm:computer:browserless:last_capture", JSON.stringify({ ...payload, screenshotDataUrl: undefined }), { EX: 3600 });
+  await sendRedisCommand(["SET", "okm:computer:browserless:last_capture", JSON.stringify({ ...payload, screenshotDataUrl: undefined }), "EX", "3600"]);
   return payload;
 });
 
@@ -1872,7 +2049,7 @@ app.post("/v1/computer/browserless/action", async ({ request }) => {
     capturedAt: new Date().toISOString(),
   };
 
-  await redis.set("okm:computer:browserless:last_action", JSON.stringify({ ...payload, screenshotDataUrl: undefined }), { EX: 3600 });
+  await sendRedisCommand(["SET", "okm:computer:browserless:last_action", JSON.stringify({ ...payload, screenshotDataUrl: undefined }), "EX", "3600"]);
   return payload;
 });
 
@@ -2008,11 +2185,13 @@ app.get("/v1/auth/poe/start", async ({ request }) => {
   const state = base64UrlEncode(stateBytes);
 
   // Persist state + verifier for 10 minutes
-  await redis.set(
+  await sendRedisCommand([
+    "SET",
     `okm:poe:oauth_state:${state}`,
     JSON.stringify({ codeVerifier, returnTo, createdAt: Date.now() }),
-    { EX: 600 },
-  );
+    "EX",
+    "600",
+  ]);
 
   const authorize = new URL(poeAuthorizeUrl);
   authorize.searchParams.set("response_type", "code");
@@ -2046,11 +2225,11 @@ app.get("/v1/auth/poe/callback", async ({ request }) => {
   }
 
   // Validate state + retrieve PKCE verifier
-  const stored = await redis.get(`okm:poe:oauth_state:${state}`);
+  const stored = await sendRedisCommand(["GET", `okm:poe:oauth_state:${state}`]);
   if (!stored || typeof stored !== "string") {
     return makeJsonResponse({ error: "Invalid or expired state" }, 400);
   }
-  await redis.del(`okm:poe:oauth_state:${state}`);
+  await sendRedisCommand(["DEL", `okm:poe:oauth_state:${state}`]);
 
   let codeVerifier = "";
   let returnTo = "/";
@@ -2128,7 +2307,7 @@ app.get("/v1/auth/poe/callback", async ({ request }) => {
     issuedAt: new Date().toISOString(),
     userInfo,
   };
-  await redis.set(`okm:poe:user:${externalUserId}`, JSON.stringify(record), { EX: ttlSeconds });
+  await sendRedisCommand(["SET", `okm:poe:user:${externalUserId}`, JSON.stringify(record), "EX", String(ttlSeconds)]);
 
   // Bounce back to frontend with success marker (NEVER include token in URL).
   const back = new URL(okmanusFrontendOrigin);
@@ -2155,7 +2334,7 @@ console.log(`OkManus Upstash-compatible Redis REST API listening on http://${hos
 // Cierre limpio: desconecta Redis antes de terminar para evitar conexiones huérfanas
 async function shutdown(signal: string) {
   console.log(`${signal} received, shutting down`);
-  await redis.quit();
+  await Promise.all(redisBackends.map((backend) => backend.client.quit().catch(() => undefined)));
   process.exit(0);
 }
 
