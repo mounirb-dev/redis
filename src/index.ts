@@ -66,9 +66,9 @@ const insforgeServiceKey =
   process.env.INSFORGE_SERVICE_KEY ??
   process.env.INSFORGE_API_KEY ??
   process.env.INSFORGE_ANON_KEY;
-const insforgeArchiveRpcUrl =
-  process.env.INSFORGE_ARCHIVE_RPC_URL ??
-  (insforgeBaseUrl ? `${insforgeBaseUrl}/rest/v1/rpc/archive_okmanus_chat_session` : "");
+const insforgeLinkChatRpcUrl =
+  process.env.INSFORGE_LINK_CHAT_RPC_URL ??
+  (insforgeBaseUrl ? `${insforgeBaseUrl}/rest/v1/rpc/link_appwrite_chat` : "");
 const browserlessApiKey = process.env.BROWSERLESS_API_KEY;
 const browserlessEndpoint = (process.env.BROWSERLESS_ENDPOINT ?? "https://production-sfo.browserless.io").replace(/\/$/, "");
 const mcpRegistryTtlSeconds = Number(process.env.MCP_REGISTRY_TTL_SECONDS ?? 3600);
@@ -999,7 +999,7 @@ function stableUuidFromString(value: string) {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-function resolveArchiveUserId(body: Record<string, unknown>, actorUserId: string) {
+function resolveInsforgeUserId(body: Record<string, unknown>, actorUserId: string) {
   const explicit = optionalStringField(body.insforgeUserId ?? body.user_id ?? body.userId);
   if (explicit && isUuid(explicit)) return explicit;
   return stableUuidFromString(actorUserId);
@@ -1284,49 +1284,19 @@ async function getSessionJobIds(sessionId: string, count: number) {
   return parseRedisArray(await sendRedisCommand(["LRANGE", sessionJobsKey(sessionId), "0", String(count - 1)]) as RedisReply);
 }
 
-async function buildArchiveMessages(jobIds: string[]) {
-  const jobs = (await Promise.all(jobIds.map((jobId) => getJob(jobId)))).filter(Boolean) as Array<ReturnType<typeof serializeJob>>;
-  const messages = await Promise.all(
-    jobs.map(async (job) => {
-      const eventsReply = await sendRedisCommand(["XRANGE", jobEventsKey(job.job_id), "-", "+", "COUNT", "200"]) as RedisReply;
-      return {
-        external_job_id: job.job_id,
-        external_event_id: `${job.job_id}:prompt`,
-        role: "user",
-        content: job.prompt || JSON.stringify(job.target),
-        tool_calls: {
-          status: job.status,
-          queue: job.queue,
-          plan: job.plan,
-          taskType: job.task_type,
-          target: job.target,
-          runtime: job.runtime,
-          artifacts: job.artifacts,
-          verification: job.verification,
-        },
-        sandbox_steps: serializeRedisStream(eventsReply),
-        created_at: job.created_at,
-      };
-    }),
-  );
-
-  return { jobs, messages };
-}
-
-async function archiveSessionInInsforge(input: {
-  userId: string;
+async function linkAppwriteChatInInsforge(input: {
+  insforgeUserId: string;
   appwriteUserId: string;
-  sessionId: string;
+  appwriteChatId: string;
+  appwriteSessionId: string;
   workspaceId: string;
-  title: string;
-  model: string;
-  messages: unknown[];
+  metadata: Record<string, unknown>;
 }) {
-  if (!insforgeArchiveRpcUrl || !insforgeServiceKey) {
-    throw new Error("Insforge archive is not configured");
+  if (!insforgeLinkChatRpcUrl || !insforgeServiceKey) {
+    throw new Error("Insforge chat link is not configured");
   }
 
-  const response = await fetch(insforgeArchiveRpcUrl, {
+  const response = await fetch(insforgeLinkChatRpcUrl, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -1334,25 +1304,24 @@ async function archiveSessionInInsforge(input: {
       authorization: `Bearer ${insforgeServiceKey}`,
     },
     body: JSON.stringify({
-      p_user_id: input.userId,
+      p_insforge_user_id: input.insforgeUserId,
       p_appwrite_user_id: input.appwriteUserId,
-      p_session_id: input.sessionId,
+      p_appwrite_chat_id: input.appwriteChatId,
+      p_appwrite_session_id: input.appwriteSessionId,
       p_workspace_id: input.workspaceId,
-      p_title: input.title,
-      p_model: input.model,
-      p_messages: input.messages,
+      p_metadata: input.metadata,
     }),
   });
 
   const data = await response.json().catch(() => null);
   if (!response.ok) {
-    throw new Error(data?.message ?? data?.error ?? `Insforge archive failed: ${response.status}`);
+    throw new Error(data?.message ?? data?.error ?? `Insforge chat link failed: ${response.status}`);
   }
 
   return Array.isArray(data) ? data[0] : data;
 }
 
-async function deleteArchivedSessionFromRedis(sessionId: string, jobIds: string[], userId: string) {
+async function deleteLinkedSessionFromRedis(sessionId: string, jobIds: string[], userId: string) {
   const commands: Command[] = [
     ["DEL", sessionKey(sessionId)],
     ["DEL", sessionJobsKey(sessionId)],
@@ -1650,7 +1619,7 @@ app.get("/v1/sessions/:sessionId/jobs", async ({ params }) => {
   };
 });
 
-app.post("/v1/sessions/:sessionId/archive", async ({ request, params }) => {
+app.post("/v1/sessions/:sessionId/link", async ({ request, params }) => {
   const actor = await getProductActor(request);
   const body = await readJsonObject(request);
   const sessionId = normalizeRedisId(params.sessionId, "sess");
@@ -1658,37 +1627,42 @@ app.post("/v1/sessions/:sessionId/archive", async ({ request, params }) => {
   const clearRedis = body.clearRedis === true;
   const session = await getSessionManifest(sessionId);
   const jobIds = await getSessionJobIds(sessionId, count);
-  if (!jobIds.length) return makeJsonResponse({ error: "No Redis jobs found for session" }, 404);
-
-  const { jobs, messages } = await buildArchiveMessages(jobIds);
+  const jobs = (await Promise.all(jobIds.map((jobId) => getJob(jobId)))).filter(Boolean) as Array<ReturnType<typeof serializeJob>>;
+  const appwriteChatId = stringField(body.appwriteChatId ?? body.chatId ?? body.conversationId, sessionId);
   const workspaceId = stringField(body.workspaceId, session.workspaceId || jobs[0]?.workspace_id || "workspace");
-  const title = stringField(body.title, jobs[0]?.prompt || "OkManus conversation").slice(0, 160);
-  const model = stringField(body.model, jobs[0]?.runtime && typeof jobs[0].runtime === "object" ? String((jobs[0].runtime as Record<string, unknown>).model ?? "") : "");
   const appwriteUserId = actor.userId;
-  const userId = resolveArchiveUserId(body, appwriteUserId);
+  const insforgeUserId = resolveInsforgeUserId(body, appwriteUserId);
 
-  const archived = await archiveSessionInInsforge({
-    userId,
+  const link = await linkAppwriteChatInInsforge({
+    insforgeUserId,
     appwriteUserId,
-    sessionId,
+    appwriteChatId,
+    appwriteSessionId: sessionId,
     workspaceId,
-    title,
-    model,
-    messages,
+    metadata: {
+      jobIds,
+      jobCount: jobIds.length,
+      source: "redis-okmanus",
+    },
   });
 
   if (clearRedis) {
-    await deleteArchivedSessionFromRedis(sessionId, jobIds, actor.userId);
+    await deleteLinkedSessionFromRedis(sessionId, jobIds, actor.userId);
   }
 
   return {
-    archived,
+    link,
     sessionId,
-    userId,
+    appwriteChatId,
+    insforgeUserId,
     appwriteUserId,
-    messages: messages.length,
+    linkedJobs: jobIds.length,
     redisCleared: clearRedis,
   };
+});
+
+app.post("/v1/sessions/:sessionId/archive", async ({ request, params }) => {
+  return app.handle(new Request(new URL(`/v1/sessions/${params.sessionId}/link`, request.url), request));
 });
 
 app.post("/v1/jobs", async ({ request }) => {
