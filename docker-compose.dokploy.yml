@@ -1,12 +1,13 @@
 services:
   api-okmanus:
+    container_name: redis-okmanus-api
     build: .
     ports:
-      - "${APP_PORT:-3000}:3000"
+      - "${APP_PORT:-3001}:3000"
     environment:
       PORT: 3000
       HOST: 0.0.0.0
-      REDIS_URL: redis://dragonfly:6379/0
+      REDIS_URL: redis://redis-okmanus-dragonfly:6379/0
       UPSTASH_REDIS_REST_TOKEN: ${UPSTASH_REDIS_REST_TOKEN:?set UPSTASH_REDIS_REST_TOKEN}
       UPSTASH_REDIS_REST_READONLY_TOKEN: ${UPSTASH_REDIS_REST_READONLY_TOKEN:-}
       RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS:-60}
@@ -42,6 +43,7 @@ services:
     restart: unless-stopped
 
   dragonfly:
+    container_name: redis-okmanus-dragonfly
     image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
     command:
       [
